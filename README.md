@@ -1,4 +1,4 @@
-# API v2 - Probabilistic Validation System
+# API v2 - Talisman AI
 
 ## Overview
 
