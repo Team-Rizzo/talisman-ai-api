@@ -1,10 +1,24 @@
-fastapi==0.110.1
-uvicorn>=0.24.0
+# Talisman AI API Dependencies
+
+# FastAPI and server
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+
+# Database
+prisma>=0.11.0
+
+# Pydantic for data validation
 pydantic>=2.5.0
-python-dotenv>=1.0.0
+
+# Bittensor for authentication
 bittensor>=7.0.0
-bittensor-wallet>=1.0.0
-python-dateutil>=2.8.0
-psycopg2-binary>=2.9.0
-requests>=2.31.0
-tweepy>=4.19.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# HTTP client (for internal calls if needed)
+httpx>=0.25.0
+
+# Async support
+asyncio>=3.4.3
+

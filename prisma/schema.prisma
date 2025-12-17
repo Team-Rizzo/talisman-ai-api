@@ -1,0 +1,87 @@
+// Prisma schema for Talisman AI API
+// PostgreSQL database
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider             = "prisma-client-py"
+  interface            = "asyncio"
+  recursive_type_depth = 5
+}
+
+model Tweet {
+  id                  String    @id @default(cuid())
+  createdAt           DateTime  @map("created_at")
+  text                String
+  userId              String    @map("user_id")
+  insertionTimestamp  DateTime  @default(now()) @map("insertion_timestamp")
+  timestamp           DateTime
+  sentiment           String?
+  like_count          Int       @default(0) @map("like_count")
+  retweet_count       Int       @default(0) @map("retweet_count")
+  reply_count         Int       @default(0) @map("reply_count")
+  quote_count         Int       @default(0) @map("quote_count")
+  url                 String?   @map("url")
+
+
+  // Relations
+  user                User      @relation(fields: [userId], references: [id])
+  scorings            Scoring[]
+  
+  @@map("tweets")
+}
+
+model Scoring {
+  id              String    @id @default(cuid())
+  tweetId         String    @map("tweet_id")
+  status          String    @default("pending") // pending, in_progress, completed
+  startTime       DateTime? @map("start_time")
+  validatorHotkey String?   @map("validator_hotkey")
+  
+  // Relations
+  tweet           Tweet     @relation(fields: [tweetId], references: [id], onDelete: Cascade)
+  
+  @@map("scoring")
+}
+
+model User {
+  id          String   @id
+  username    String   @unique
+  screenName  String   @map("screen_name")
+  following_count   Int      @default(0)
+  followers_count   Int      @default(0)
+  
+  // Relations
+  tweets      Tweet[]
+  
+  @@map("users")
+}
+
+model Penalty {
+  id        String   @id @default(cuid())
+  hotkey    String
+  reason    String
+  timestamp DateTime @default(now())
+  
+  @@map("penalties")
+}
+
+model Reward {
+  id         String @id @default(cuid())
+  startBlock Int    @map("start_block")
+  stopBlock  Int    @map("stop_block")
+  hotkey     String
+  points     Float
+  
+  @@map("rewards")
+}
+
+model BlacklistedHotkey {
+  hotkey String @id
+  
+  @@map("blacklisted_hotkeys")
+}
+

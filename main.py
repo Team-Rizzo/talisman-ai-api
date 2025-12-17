@@ -1,618 +1,597 @@
+#!/usr/bin/env python3
 """
-FastAPI v2 - Probabilistic Validation System
-- Miners submit posts with adjustable submission rate limits (per block window)
-- 20% chance (adjustable) of submission being chosen for validation
-- Validators GET validation payloads (post to validate)
-- Validators GET scores endpoint to retrieve average scores per block window (global window for all hotkeys)
-- Validators POST validation results (success/failure)
-- Reward is set based on validation result (average score for current block window if success, 0 if failure)
+Talisman AI API - FastAPI Application
+
+This API provides endpoints for validators to:
+- Get unscored tweets for scoring
+- Submit rewards, penalties, and completed tweets
+- Manage blacklisted hotkeys
+
+Only validators with valid signatures are allowed to access the API.
 """
 
-# Load environment variables from .env file
 import os
-try:
-    from dotenv import load_dotenv
-    dotenv_path = os.path.join(os.path.dirname(__file__), ".env")
-    load_dotenv(dotenv_path)
-except ImportError:
-    # dotenv not available, rely on system environment variables
-    pass
-
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+import logging
+from datetime import datetime
 from contextlib import asynccontextmanager
-import time
-import json
-import asyncio
+from typing import List, Optional
 
-from models import PostSubmission, ValidationPayload, ValidationPayloadsResponse, ValidationResult, ValidationResultsPayload
-from database import (
-    init_database,
-    insert_submission,
-    select_post_for_validation,
-    get_pending_validations,
-    record_validation_result,
-    MAX_SUBMISSION_RATE,
-    get_all_hotkey_scores_last_block_window,
-    VALIDATIONS_PER_REQUEST,
-    BLOCKS_PER_WINDOW,
-    init_connection_pool,
-    close_connection_pool,
-    get_rate_limit_info,
-    get_block_window_start,
-    get_block_window_end,
+from fastapi import FastAPI, Depends, HTTPException, Request, status
+from fastapi.middleware.cors import CORSMiddleware
+from prisma import Prisma
+
+# Local imports
+from models import (
+    Tweet, TweetWithUser, User,
+    Scoring, ScoringUpdate,
+    Penalty, PenaltyCreate, PenaltyBulkCreate,
+    Reward, RewardCreate, RewardBulkCreate,
+    BlacklistedHotkey, BlacklistedHotkeyCreate, BlacklistedHotkeyBulkCreate,
+    TweetsForScoringResponse, CompletedTweetsSubmission,
+    SubmissionResponse, ErrorResponse,
 )
-from auth_utils import (
+from utils.auth import (
+    AuthRequest,
     auth_config,
     extract_auth_from_headers,
     verify_auth_request,
-    AuthRequest
 )
-from hotkey_whitelist import is_miner_hotkey as check_miner, is_validator_hotkey as check_validator, initialize_whitelists, is_blacklisted
-from block_utils import get_current_block
+from hotkey_whitelist import (
+    is_validator_hotkey,
+    initialize_whitelists,
+)
 
-# Configuration
-# Validation selection probability (configured via VALIDATION_PROBABILITY env var; default 20%)
-_raw_validation_prob = float(os.getenv("VALIDATION_PROBABILITY", "0.20"))
-if not (0.0 < _raw_validation_prob <= 1.0):
-    print(f"[API v2] WARNING: VALIDATION_PROBABILITY={_raw_validation_prob} out of range (0,1], clamping to 0.20")
-    _raw_validation_prob = 0.20
-VALIDATION_PROBABILITY = _raw_validation_prob
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
-# -------------------------
-# Application Lifespan
-# -------------------------
+# Initialize Prisma client
+prisma = Prisma()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Application lifespan manager for startup/shutdown events."""
     # Startup
-    init_database()
-    init_connection_pool()
+    logger.info("Starting Talisman AI API...")
     
-    # Initialize whitelists (miner hotkeys from metagraph, validator hotkeys from file)
-    print("[API v2] Initializing hotkey whitelists...")
-    initialize_whitelists()
+    # Initialize whitelist caches
+    try:
+        initialize_whitelists()
+        logger.info("Whitelists initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize whitelists: {e}")
     
-    # Refresh auth config to include the newly loaded whitelists
-    auth_config.refresh_whitelist()
-    print(f"[API v2] Auth whitelist refreshed: {len(auth_config.allowed_hotkeys)} total hotkeys")
-    print(f"[API v2] Validation probability: {VALIDATION_PROBABILITY*100:.1f}%")
-    print(f"[API v2] Max submission rate: {MAX_SUBMISSION_RATE} per {BLOCKS_PER_WINDOW} blocks (~{BLOCKS_PER_WINDOW * 12 / 60:.1f} minutes)")
-    print(f"[API v2] Validations per request: {VALIDATIONS_PER_REQUEST}")
+    # Connect to database
+    try:
+        await prisma.connect()
+        logger.info("Connected to database")
+    except Exception as e:
+        logger.error(f"Failed to connect to database: {e}")
+        raise
     
     yield
+    
     # Shutdown
-    close_connection_pool()
-    print("[API v2] Shutting down")
+    logger.info("Shutting down Talisman AI API...")
+    await prisma.disconnect()
+    logger.info("Disconnected from database")
 
+
+# Create FastAPI application
 app = FastAPI(
-    title="Miner API (v2)", 
-    description="Probabilistic validation system - miners submit posts, validators validate individual posts",
-    lifespan=lifespan
+    title="Talisman AI API",
+    description="API for Talisman AI subnet validators to score tweets and manage rewards/penalties",
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
-# -------------------------
-# Exception Handlers
-# -------------------------
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    """Log validation errors for debugging."""
-    errors = exc.errors()
-    error_details = []
-    for error in errors:
-        error_details.append({
-            "field": ".".join(str(loc) for loc in error.get("loc", [])),
-            "message": error.get("msg"),
-            "type": error.get("type"),
-            "input": error.get("input")
-        })
-    
-    print(f"[API v2] ✗ Validation error on {request.method} {request.url.path}")
-    print(f"[API v2] Validation errors: {json.dumps(error_details, indent=2)}")
-    
-    return JSONResponse(
-        status_code=422,
-        content={
-            "detail": error_details,
-            "message": "Validation error - check field details"
-        }
-    )
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# -------------------------
-# Health Endpoints
-# -------------------------
-@app.get("/")
-async def root():
-    return {"message": "Miner API v2 is running", "status": "healthy", "version": "2.0"}
 
+# ============================================================================
+# Authentication Dependencies
+# ============================================================================
+
+async def get_validator_hotkey(request: Request) -> str:
+    """
+    Dependency to authenticate validator and return their hotkey.
+    
+    Only validators are allowed to access the API. This function:
+    1. Extracts auth data from request headers
+    2. Verifies the signature
+    3. Confirms the hotkey belongs to a validator
+    4. Returns the validator's hotkey
+    
+    Raises HTTPException if authentication fails.
+    """
+    # Extract auth from headers
+    auth_request = extract_auth_from_headers(request)
+    
+    if auth_request is None:
+        logger.warning("Missing authentication headers")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing authentication headers. Required: X-Auth-SS58Address, X-Auth-Signature, X-Auth-Message, X-Auth-Timestamp",
+        )
+    
+    # Verify auth request
+    if not verify_auth_request(auth_request, auth_config):
+        logger.warning(f"Authentication failed for hotkey: {auth_request.ss58_address}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication. Signature verification failed.",
+        )
+    
+    # Check if hotkey is a validator
+    if not is_validator_hotkey(auth_request.ss58_address):
+        logger.warning(f"Non-validator hotkey attempted access: {auth_request.ss58_address}")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied. Only validators are allowed to access this API.",
+        )
+    
+    logger.info(f"Validator authenticated: {auth_request.ss58_address}")
+    return auth_request.ss58_address
+
+
+# ============================================================================
+# Health Check
+# ============================================================================
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "version": "2.0"}
+    """Health check endpoint."""
+    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
 
-@app.get("/v2/status")
-async def get_status(request: Request):
-    """
-    Get current API status including block number and window information.
-    
-    Useful for miners to synchronize their block tracking with the API.
-    No authentication required (public endpoint).
-    
-    Returns:
-        - current_block: Current block number (API's view)
-        - window_start_block: Start block of current window
-        - window_end_block: End block of current window
-        - next_window_start_block: Start block of next window
-        - blocks_per_window: Number of blocks per window
-        - blocks_until_next_window: Blocks until next window starts
-    """
-    # Run blocking call in executor to avoid blocking the event loop
-    loop = asyncio.get_event_loop()
-    current_block = await loop.run_in_executor(None, get_current_block)
-    window_start = get_block_window_start(current_block)
-    window_end = get_block_window_end(current_block)
-    next_window_start = window_start + BLOCKS_PER_WINDOW
-    blocks_until_next_window = next_window_start - current_block
-    
-    return {
-        "status": "ok",
-        "current_block": current_block,
-        "window_start_block": window_start,
-        "window_end_block": window_end,
-        "next_window_start_block": next_window_start,
-        "blocks_per_window": BLOCKS_PER_WINDOW,
-        "blocks_until_next_window": blocks_until_next_window,
-        "current_window": current_block // BLOCKS_PER_WINDOW,
-    }
+# ============================================================================
+# Tweet Routes
+# ============================================================================
 
-
-# -------------------------
-# V1 Deprecation - Catch-all route for /v1/ endpoints
-# -------------------------
-@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
-async def v1_deprecated(path: str, request: Request):
-    """
-    Catch-all route for all /v1/ endpoints.
-    Returns a deprecation message asking users to update to v2.
-    """
-    return JSONResponse(
-        status_code=410,  # 410 Gone - indicates the resource is no longer available
-        content={
-            "error": "deprecated",
-            "message": "Please update to API v2. The v1 API is no longer supported.",
-            "current_version": "2.0"
-        }
-    )
-
-
-# -------------------------
-# Authentication Helper Functions
-# -------------------------
-# Access control is three layers:
-#   1. Signature verification (auth_utils) - validates signed headers
-#   2. Whitelist check (hotkey_whitelist) - hotkey in metagraph miners/validators
-#   3. Blacklist check (miners only) - prefix-based blocking in /v2/submit
-# See README.md "Authentication & Access Control" for details.
-# -------------------------
-async def verify_miner_auth(request: Request) -> AuthRequest:
-    """Verify authentication for miner endpoints"""
-    if not auth_config.enabled:
-        return None
-    
-    auth_request = extract_auth_from_headers(request)
-    if not auth_request:
-        raise HTTPException(status_code=401, detail="Authentication required for miners")
-    
-    if not verify_auth_request(auth_request, auth_config):
-        raise HTTPException(status_code=403, detail="Authentication failed")
-    
-    # Verify the hotkey is actually a miner
-    if not check_miner(auth_request.ss58_address):
-        raise HTTPException(status_code=403, detail="Hotkey is not a registered miner")
-    
-    return auth_request
-
-async def verify_validator_auth(request: Request) -> AuthRequest:
-    """Verify authentication for validator endpoints"""
-    if not auth_config.enabled:
-        return None
-    
-    auth_request = extract_auth_from_headers(request)
-    if not auth_request:
-        raise HTTPException(status_code=401, detail="Authentication required for validators")
-    
-    if not verify_auth_request(auth_request, auth_config):
-        raise HTTPException(status_code=403, detail="Authentication failed")
-    
-    # Verify the hotkey is actually a validator
-    if not check_validator(auth_request.ss58_address):
-        raise HTTPException(status_code=403, detail="Hotkey is not a registered validator")
-    
-    return auth_request
-
-# -------------------------
-# Submit Endpoint (idempotent per (miner_hotkey, post_id))
-# -------------------------
-@app.post("/v2/submit")
-async def submit_post(
-    post: PostSubmission,
-    request: Request,
+@app.get(
+    "/tweets/unscored",
+    response_model=TweetsForScoringResponse,
+    responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}},
+)
+async def get_unscored_tweets(
+    limit: int = 3,
+    validator_hotkey: str = Depends(get_validator_hotkey),
 ):
     """
-    Submit a post for validation (unique on (miner_hotkey, post_id)).
-    Returns status="new" for new submissions or status="duplicate" for duplicates.
-    Requires miner authentication.
+    Get tweets that haven't been started for scoring yet.
     
-    With probability VALIDATION_PROBABILITY (default 20%), the submission will be
-    selected for validation. If selected, it will be available for validators to GET.
+    Returns up to `limit` tweets (default 3) that have a scoring status of 'pending'.
+    Marks the returned tweets as 'in_progress' and assigns them to the requesting validator.
+    
+    Only accessible by validators.
     """
-    # Verify miner authentication
-    auth_request = await verify_miner_auth(request)
-    
-    # Verify that the authenticated hotkey matches the post's miner_hotkey
-    if auth_request and auth_request.ss58_address != post.miner_hotkey:
-        raise HTTPException(
-            status_code=403, 
-            detail=f"Authenticated hotkey {auth_request.ss58_address} does not match post miner_hotkey {post.miner_hotkey}"
+    try:
+        # Find tweets with pending scoring status
+        scorings = await prisma.scoring.find_many(
+            where={"status": "pending"},
+            include={"tweet": {"include": {"user": True}}},
+            take=limit,
         )
-    
-    # Check blacklist (configured via BLACKLISTED_HOTKEY_PREFIXES env var in hotkey_whitelist.py)
-    if is_blacklisted(post.miner_hotkey):
-        raise HTTPException(
-            status_code=403,
-            detail="Your key has been timed out due to consistent poor / inaccurate post submission"
-        )
-    
-    print(f"[API v2] ========== POST /v2/submit ==========")
-    print(f"[API v2] Received submission: post_id={post.post_id}, miner_hotkey={post.miner_hotkey}")
-    if auth_request:
-        print(f"[API v2] Authenticated hotkey: {auth_request.ss58_address}")
-    print(f"[API v2] Post metadata: author={post.author}, date={post.date}, sentiment={post.sentiment}")
-    print(f"[API v2] Tokens: {list(post.tokens.keys()) if post.tokens else 'None'}")
-
-    now = int(time.time())
-    print(f"[API v2] Inserting submission into database...")
-    
-    # Run database operations in executor to avoid blocking the event loop
-    # get_current_block() is called inside insert_submission() with error handling
-    loop = asyncio.get_event_loop()
-    is_new, message, error_code, rate_limit_info = await loop.run_in_executor(None, insert_submission, post, now)
-    print(f"[API v2] {message}")
-    
-    if error_code == "limit_exceeded":
-        print(f"[API v2] ✗ Submission rejected: rate limit exceeded for hotkey={post.miner_hotkey}")
         
-        # Build detailed error response with rate limit information
-        if rate_limit_info:
-            detail_message = (
-                f"Submission rate limit exceeded. "
-                f"You have used {rate_limit_info['current_count']}/{rate_limit_info['max_submissions']} submissions "
-                f"in the current block window (blocks {rate_limit_info['window_start_block']}-{rate_limit_info['window_end_block']}). "
-                f"Limit resets at block {rate_limit_info['next_window_start_block']} "
-                f"(in ~{rate_limit_info['estimated_seconds_until_reset']:.0f} seconds / ~{rate_limit_info['estimated_seconds_until_reset']/60:.1f} minutes)."
+        if not scorings:
+            return TweetsForScoringResponse(tweets=[], count=0)
+        
+        # Mark these tweets as in_progress and assign to validator
+        tweet_ids = [s.tweetId for s in scorings]
+        await prisma.scoring.update_many(
+            where={"tweetId": {"in": tweet_ids}},
+            data={
+                "status": "in_progress",
+                "startTime": datetime.utcnow(),
+                "validatorHotkey": validator_hotkey,
+            },
+        )
+        
+        # Build response with tweet and user data
+        tweets_with_users = []
+        for scoring in scorings:
+            if scoring.tweet and scoring.tweet.user:
+                tweet_data = TweetWithUser(
+                    id=scoring.tweet.id,
+                    createdAt=scoring.tweet.createdAt,
+                    text=scoring.tweet.text,
+                    userId=scoring.tweet.userId,
+                    timestamp=scoring.tweet.timestamp,
+                    sentiment=scoring.tweet.sentiment,
+                    insertionTimestamp=scoring.tweet.insertionTimestamp,
+                    user=User(
+                        id=scoring.tweet.user.id,
+                        username=scoring.tweet.user.username,
+                        screenName=scoring.tweet.user.screenName,
+                        following_count=scoring.tweet.user.following_count,
+                        followers_count=scoring.tweet.user.followers_count,
+                    ),
+                )
+                tweets_with_users.append(tweet_data)
+        
+        logger.info(f"Assigned {len(tweets_with_users)} tweets to validator {validator_hotkey}")
+        return TweetsForScoringResponse(tweets=tweets_with_users, count=len(tweets_with_users))
+    
+    except Exception as e:
+        logger.error(f"Error getting unscored tweets: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get unscored tweets: {str(e)}",
+        )
+
+
+@app.post(
+    "/tweets/completed",
+    response_model=SubmissionResponse,
+    responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}},
+)
+async def submit_completed_tweets(
+    submission: CompletedTweetsSubmission,
+    validator_hotkey: str = Depends(get_validator_hotkey),
+):
+    """
+    Submit completed scored tweets.
+    
+    Updates the scoring status to 'completed' and stores the sentiment for each tweet.
+    Only tweets assigned to the requesting validator can be completed.
+    
+    Only accessible by validators.
+    """
+    try:
+        updated_count = 0
+        
+        for completed in submission.completed_tweets:
+            # Update the tweet's sentiment
+            await prisma.tweet.update(
+                where={"id": completed.tweet_id},
+                data={"sentiment": completed.sentiment},
             )
-            # Include structured data in response (FastAPI will serialize dict to JSON)
-            raise HTTPException(
-                status_code=429,
-                detail={
-                    "error": "rate_limit_exceeded",
-                    "message": detail_message,
-                    "rate_limit": {
-                        "current_count": rate_limit_info['current_count'],
-                        "max_submissions": rate_limit_info['max_submissions'],
-                        "remaining": 0,
-                        "current_block": rate_limit_info['current_block'],
-                        "window_start_block": rate_limit_info['window_start_block'],
-                        "window_end_block": rate_limit_info['window_end_block'],
-                        "next_window_start_block": rate_limit_info['next_window_start_block'],
-                        "blocks_until_reset": rate_limit_info['blocks_until_reset'],
-                        "estimated_seconds_until_reset": int(rate_limit_info['estimated_seconds_until_reset']),
-                        "blocks_per_window": rate_limit_info['blocks_per_window'],
-                        "current_window": rate_limit_info['current_window'],
-                    }
+            
+            # Update scoring status to completed
+            result = await prisma.scoring.update_many(
+                where={
+                    "tweetId": completed.tweet_id,
+                    "validatorHotkey": validator_hotkey,
                 },
-                headers={
-                    "X-RateLimit-Limit": str(rate_limit_info['max_submissions']),
-                    "X-RateLimit-Remaining": "0",
-                    "X-RateLimit-Reset-Block": str(rate_limit_info['next_window_start_block']),
-                    "X-RateLimit-Reset-Seconds": str(int(rate_limit_info['estimated_seconds_until_reset'])),
+                data={"status": "completed"},
+            )
+            updated_count += result
+        
+        logger.info(f"Validator {validator_hotkey} completed {updated_count} tweets")
+        return SubmissionResponse(
+            success=True,
+            message=f"Successfully completed {updated_count} tweets",
+            count=updated_count,
+        )
+    
+    except Exception as e:
+        logger.error(f"Error submitting completed tweets: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to submit completed tweets: {str(e)}",
+        )
+
+
+# ============================================================================
+# Reward Routes
+# ============================================================================
+
+@app.post(
+    "/rewards",
+    response_model=SubmissionResponse,
+    responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}},
+)
+async def submit_rewards(
+    submission: RewardBulkCreate,
+    validator_hotkey: str = Depends(get_validator_hotkey),
+):
+    """
+    Submit rewards for miners.
+    
+    Creates reward records for the specified hotkeys with their points.
+    
+    Only accessible by validators.
+    """
+    try:
+        created_count = 0
+        
+        for reward in submission.rewards:
+            await prisma.reward.create(
+                data={
+                    "startBlock": reward.start_block,
+                    "stopBlock": reward.stop_block,
+                    "hotkey": reward.hotkey,
+                    "points": reward.points,
                 }
             )
-        else:
-            # Fallback if rate_limit_info is not available
-            raise HTTPException(
-                status_code=429,
-                detail=f"Submission rate limit exceeded. Maximum {MAX_SUBMISSION_RATE} submissions per {BLOCKS_PER_WINDOW} blocks (~{BLOCKS_PER_WINDOW * 12 / 60:.1f} minutes) allowed."
-            )
-    
-    # Get rate limit info for synchronization (always include in response)
-    rate_limit_info = await loop.run_in_executor(None, get_rate_limit_info, post.miner_hotkey)
-    
-    # Build base response with block/window info for synchronization
-    base_response = {
-        "current_block": rate_limit_info["current_block"],
-        "window_start_block": rate_limit_info["window_start_block"],
-        "window_end_block": rate_limit_info["window_end_block"],
-        "next_window_start_block": rate_limit_info["next_window_start_block"],
-        "blocks_per_window": rate_limit_info["blocks_per_window"],
-        "current_window": rate_limit_info["current_window"],
-        "rate_limit": {
-            "current_count": rate_limit_info["current_count"],
-            "max_submissions": rate_limit_info["max_submissions"],
-            "remaining": max(0, rate_limit_info["max_submissions"] - rate_limit_info["current_count"]),
-        }
-    }
-    
-    if not is_new:
-        print(f"[API v2] ⚠️  Duplicate submission ignored: post_id={post.post_id}")
-        return {
-            "status": "duplicate", 
-            "message": "Post already exists, ignored",
-            **base_response
-        }
-    
-    # New submission - check if it should be selected for validation
-    print(f"[API v2] Checking if post should be selected for validation (probability={VALIDATION_PROBABILITY*100:.1f}%)...")
-    
-    # Prepare post data dict for TwitterAPI.io validation
-    post_data = {
-        "content": post.content,
-        "author": post.author,
-        "date": post.date,
-        "likes": post.likes,
-        "retweets": post.retweets,
-        "responses": post.responses,
-        "followers": post.followers,
-    }
-    
-    was_selected, validation_id, x_error = await loop.run_in_executor(
-        None, 
-        select_post_for_validation,
-        post.miner_hotkey, 
-        post.post_id,
-        post_data,
-        now, 
-        VALIDATION_PROBABILITY
-    )
-    
-    if was_selected:
-        if validation_id:
-            # Selected and TwitterAPI.io validation passed
-            print(f"[API v2] ✓ Post selected for validation and TwitterAPI.io validation passed! validation_id={validation_id}")
-            return {
-                "status": "new", 
-                "message": "Submission accepted and selected for validation",
-                "selected_for_validation": True,
-                "x_validation_passed": True,
-                "validation_id": validation_id,
-                **base_response
-            }
-        else:
-            # Selected but TwitterAPI.io validation failed
-            print(f"[API v2] ✗ Post selected but TwitterAPI.io validation failed: {x_error.get('code', 'unknown') if x_error else 'unknown'} - {x_error.get('message', 'N/A') if x_error else 'N/A'}")
-            return {
-                "status": "new", 
-                "message": "Submission accepted but TwitterAPI.io validation failed",
-                "selected_for_validation": True,
-                "x_validation_passed": False,
-                "x_validation_error": x_error,
-                **base_response
-            }
-    else:
-        print(f"[API v2] Post not selected for validation (random chance)")
-        return {
-            "status": "new", 
-            "message": "Submission accepted",
-            "selected_for_validation": False,
-            **base_response
-        }
-
-
-# -------------------------
-# Validation Payload Endpoint (for validators)
-# -------------------------
-@app.get("/v2/validation", response_model=ValidationPayloadsResponse)
-async def get_validation_payloads(request: Request):
-    """
-    Validators GET validation payloads containing:
-    - Up to VALIDATIONS_PER_REQUEST submissions (default: 5) assigned to this validator
-    - Each payload includes the post to validate
-    - Submissions are assigned on-demand (next unassigned submissions)
-    
-    Requires validator authentication.
-    Returns empty list if no pending validations are available.
-    
-    Note: Average scores for hotkeys can be retrieved from GET /v2/scores
-    """
-    # Verify validator authentication
-    auth_request = await verify_validator_auth(request)
-    
-    # Get validator hotkey from auth
-    validator_hotkey = None
-    if auth_request:
-        validator_hotkey = auth_request.ss58_address
-    
-    if not validator_hotkey:
-        raise HTTPException(status_code=401, detail="Validator authentication required")
-    
-    print(f"[API v2] ========== GET /v2/validation ==========")
-    print(f"[API v2] Validator: {validator_hotkey}")
-    
-    now = int(time.time())
-    # Run database operation in executor to avoid blocking the event loop
-    loop = asyncio.get_event_loop()
-    payloads = await loop.run_in_executor(None, get_pending_validations, validator_hotkey, now)
-    
-    if not payloads:
-        print(f"[API v2] No pending validations available for validator {validator_hotkey}")
-        return ValidationPayloadsResponse(
-            available=False,
-            payloads=[],
-            count=0
+            created_count += 1
+        
+        logger.info(f"Validator {validator_hotkey} submitted {created_count} rewards")
+        return SubmissionResponse(
+            success=True,
+            message=f"Successfully created {created_count} rewards",
+            count=created_count,
         )
     
-    print(f"[API v2] Returning {len(payloads)} validation payload(s) for validator {validator_hotkey}")
-    for i, payload in enumerate(payloads):
-        print(f"[API v2]   [{i+1}] validation_id={payload['validation_id']}, miner_hotkey={payload['miner_hotkey']}")
-    
-    # Convert to ValidationPayload models
-    validation_payloads = [
-        ValidationPayload(
-            validation_id=p["validation_id"],
-            miner_hotkey=p["miner_hotkey"],
-            post=p["post"],
-            selected_at=p["selected_at"]
+    except Exception as e:
+        logger.error(f"Error submitting rewards: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to submit rewards: {str(e)}",
         )
-        for p in payloads
-    ]
-    
-    return ValidationPayloadsResponse(
-        available=True,
-        payloads=validation_payloads,
-        count=len(validation_payloads)
-    )
 
 
-# -------------------------
-# Scores Endpoint (for validators)
-# -------------------------
-@app.get("/v2/scores")
-async def get_hotkey_scores(request: Request):
-    """
-    Validators GET average scores for all hotkeys from the previous completed block window.
-    
-    Returns a dictionary mapping miner_hotkey -> average_score.
-    Only includes hotkeys that have submissions in the previous block window (default: 100 blocks, ~20 minutes).
-    
-    IMPORTANT: This endpoint returns scores from the PREVIOUS completed window, not the current window.
-    This ensures that when a new window starts, validators can set rewards based on the completed
-    previous window's scores, rather than an incomplete current window.
-    
-    The response includes block number metadata so validators can reference the specific block
-    window that the scores were calculated for.
-    
-    Requires validator authentication.
-    """
-    # Verify validator authentication
-    auth_request = await verify_validator_auth(request)
-    
-    if not auth_request:
-        raise HTTPException(status_code=401, detail="Validator authentication required")
-    
-    print(f"[API v2] ========== GET /v2/scores ==========")
-    print(f"[API v2] Validator: {auth_request.ss58_address}")
-    
-    now = int(time.time())
-    # Run database operations in executor to avoid blocking the event loop
-    loop = asyncio.get_event_loop()
-    scores, previous_window_end_block = await loop.run_in_executor(None, get_all_hotkey_scores_last_block_window)
-    
-    current_block = await loop.run_in_executor(None, get_current_block)
-    
-    # Calculate previous window boundaries
-    current_window_start = get_block_window_start(current_block)
-    previous_window_start = current_window_start - BLOCKS_PER_WINDOW
-    previous_window_end = current_window_start - 1
-    
-    # If we're in the first window, previous_window_start will be negative
-    if previous_window_start < 0:
-        previous_window_start = 0
-        previous_window_end = current_window_start - 1 if current_window_start > 0 else 0
-    
-    print(f"[API v2] Returning scores for {len(scores)} hotkey(s) (previous block window: {previous_window_start}-{previous_window_end}, current block: {current_block})")
-    
-    return {
-        "scores": scores,
-        "count": len(scores),
-        "blocks_per_window": BLOCKS_PER_WINDOW,
-        "block_window_start": previous_window_start,
-        "block_window_end": previous_window_end,
-        "current_block": current_block,
-        "calculated_at": now,
-        "calculated_at_block": current_block,
-        "window_type": "previous"  # Indicate this is the previous window
-    }
-
-
-# -------------------------
-# Validation Result Endpoint (for validators)
-# -------------------------
-@app.post("/v2/validation_result")
-async def submit_validation_results(
-    payload: ValidationResultsPayload,
-    request: Request,
+@app.get(
+    "/rewards",
+    response_model=List[Reward],
+    responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}},
+)
+async def get_rewards(
+    hotkey: Optional[str] = None,
+    limit: int = 100,
+    validator_hotkey: str = Depends(get_validator_hotkey),
 ):
     """
-    Validators submit validation results after validating posts.
+    Get rewards, optionally filtered by hotkey.
     
-    Accepts multiple validation results (one per payload received from GET /v2/validation).
-    
-    If validation succeeds (success=True), the average score is set as the reward.
-    If validation fails (success=False), a 0 score is set.
-    
-    Requires validator authentication.
+    Only accessible by validators.
     """
-    # Verify validator authentication
-    auth_request = await verify_validator_auth(request)
+    try:
+        where = {"hotkey": hotkey} if hotkey else {}
+        rewards = await prisma.reward.find_many(
+            where=where,
+            take=limit,
+            order={"id": "desc"},
+        )
+        
+        return [
+            Reward(
+                id=r.id,
+                startBlock=r.startBlock,
+                stopBlock=r.stopBlock,
+                hotkey=r.hotkey,
+                points=r.points,
+            )
+            for r in rewards
+        ]
     
-    # Verify that the authenticated hotkey matches the payload's validator_hotkey
-    if auth_request and auth_request.ss58_address != payload.validator_hotkey:
+    except Exception as e:
+        logger.error(f"Error getting rewards: {e}")
         raise HTTPException(
-            status_code=403, 
-            detail=f"Authenticated hotkey {auth_request.ss58_address} does not match payload validator_hotkey {payload.validator_hotkey}"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get rewards: {str(e)}",
         )
-    
-    print(f"[API v2] ========== POST /v2/validation_result ==========")
-    print(f"[API v2] Validator: {payload.validator_hotkey}, results count: {len(payload.results)}")
-    if auth_request:
-        print(f"[API v2] Authenticated hotkey: {auth_request.ss58_address}")
-    
-    now = int(time.time())
-    successful_count = 0
-    failed_count = 0
-    
-    # Run database operations in executor to avoid blocking the event loop
-    loop = asyncio.get_event_loop()
-    
-    # Process each validation result
-    for i, result in enumerate(payload.results):
-        print(f"[API v2] Processing result [{i+1}/{len(payload.results)}]: validation_id={result.validation_id}, miner_hotkey={result.miner_hotkey}, success={result.success}")
-        
-        if result.failure_reason:
-            print(f"[API v2]   Failure reason: {result.failure_reason}")
-        
-        success = await loop.run_in_executor(
-            None,
-            record_validation_result,
-            result.validator_hotkey,
-            result.validation_id,
-            result.miner_hotkey,
-            result.success,
-            result.failure_reason,
-            now
-        )
-        
-        if success:
-            successful_count += 1
-        else:
-            failed_count += 1
-            print(f"[API v2]   ✗ Error recording validation result for validation_id={result.validation_id}")
-    
-    if failed_count > 0:
-        print(f"[API v2] ⚠️  {failed_count} result(s) failed to record")
-    
-    print(f"[API v2] ✓ Processed {len(payload.results)} result(s): {successful_count} successful, {failed_count} failed")
-    
-    return {
-        "status": "ok",
-        "message": f"Processed {len(payload.results)} validation result(s)",
-        "successful": successful_count,
-        "failed": failed_count
-    }
 
+
+# ============================================================================
+# Penalty Routes
+# ============================================================================
+
+@app.post(
+    "/penalties",
+    response_model=SubmissionResponse,
+    responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}},
+)
+async def submit_penalties(
+    submission: PenaltyBulkCreate,
+    validator_hotkey: str = Depends(get_validator_hotkey),
+):
+    """
+    Submit penalties for miners.
+    
+    Creates penalty records for the specified hotkeys with reasons.
+    
+    Only accessible by validators.
+    """
+    try:
+        created_count = 0
+        
+        for penalty in submission.penalties:
+            await prisma.penalty.create(
+                data={
+                    "hotkey": penalty.hotkey,
+                    "reason": penalty.reason,
+                    "timestamp": datetime.utcnow(),
+                }
+            )
+            created_count += 1
+        
+        logger.info(f"Validator {validator_hotkey} submitted {created_count} penalties")
+        return SubmissionResponse(
+            success=True,
+            message=f"Successfully created {created_count} penalties",
+            count=created_count,
+        )
+    
+    except Exception as e:
+        logger.error(f"Error submitting penalties: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to submit penalties: {str(e)}",
+        )
+
+
+@app.get(
+    "/penalties",
+    response_model=List[Penalty],
+    responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}},
+)
+async def get_penalties(
+    hotkey: Optional[str] = None,
+    limit: int = 100,
+    validator_hotkey: str = Depends(get_validator_hotkey),
+):
+    """
+    Get penalties, optionally filtered by hotkey.
+    
+    Only accessible by validators.
+    """
+    try:
+        where = {"hotkey": hotkey} if hotkey else {}
+        penalties = await prisma.penalty.find_many(
+            where=where,
+            take=limit,
+            order={"timestamp": "desc"},
+        )
+        
+        return [
+            Penalty(
+                id=p.id,
+                hotkey=p.hotkey,
+                reason=p.reason,
+                timestamp=p.timestamp,
+            )
+            for p in penalties
+        ]
+    
+    except Exception as e:
+        logger.error(f"Error getting penalties: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get penalties: {str(e)}",
+        )
+
+
+# ============================================================================
+# Blacklisted Hotkeys Routes
+# ============================================================================
+
+@app.get(
+    "/blacklist",
+    response_model=List[BlacklistedHotkey],
+    responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}},
+)
+async def get_blacklisted_hotkeys(
+    validator_hotkey: str = Depends(get_validator_hotkey),
+):
+    """
+    Get all blacklisted hotkeys.
+    
+    Only accessible by validators.
+    """
+    try:
+        blacklisted = await prisma.blacklistedhotkey.find_many()
+        return [BlacklistedHotkey(hotkey=b.hotkey) for b in blacklisted]
+    
+    except Exception as e:
+        logger.error(f"Error getting blacklisted hotkeys: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get blacklisted hotkeys: {str(e)}",
+        )
+
+
+@app.post(
+    "/blacklist",
+    response_model=SubmissionResponse,
+    responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}},
+)
+async def add_blacklisted_hotkeys(
+    submission: BlacklistedHotkeyBulkCreate,
+    validator_hotkey: str = Depends(get_validator_hotkey),
+):
+    """
+    Add hotkeys to the blacklist.
+    
+    Only accessible by validators.
+    """
+    try:
+        created_count = 0
+        
+        for hotkey in submission.hotkeys:
+            # Use upsert to avoid duplicates
+            await prisma.blacklistedhotkey.upsert(
+                where={"hotkey": hotkey},
+                data={
+                    "create": {"hotkey": hotkey},
+                    "update": {},  # No update needed, just ensure it exists
+                },
+            )
+            created_count += 1
+        
+        logger.info(f"Validator {validator_hotkey} added {created_count} hotkeys to blacklist")
+        return SubmissionResponse(
+            success=True,
+            message=f"Successfully added {created_count} hotkeys to blacklist",
+            count=created_count,
+        )
+    
+    except Exception as e:
+        logger.error(f"Error adding blacklisted hotkeys: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to add blacklisted hotkeys: {str(e)}",
+        )
+
+
+@app.delete(
+    "/blacklist/{hotkey}",
+    response_model=SubmissionResponse,
+    responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}},
+)
+async def remove_blacklisted_hotkey(
+    hotkey: str,
+    validator_hotkey: str = Depends(get_validator_hotkey),
+):
+    """
+    Remove a hotkey from the blacklist.
+    
+    Only accessible by validators.
+    """
+    try:
+        # Check if hotkey exists
+        existing = await prisma.blacklistedhotkey.find_unique(where={"hotkey": hotkey})
+        
+        if not existing:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Hotkey {hotkey} not found in blacklist",
+            )
+        
+        await prisma.blacklistedhotkey.delete(where={"hotkey": hotkey})
+        
+        logger.info(f"Validator {validator_hotkey} removed hotkey {hotkey} from blacklist")
+        return SubmissionResponse(
+            success=True,
+            message=f"Successfully removed hotkey {hotkey} from blacklist",
+            count=1,
+        )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error removing blacklisted hotkey: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to remove blacklisted hotkey: {str(e)}",
+        )
+
+
+# ============================================================================
+# Main Entry Point
+# ============================================================================
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    
+    host = os.getenv("API_HOST", "0.0.0.0")
+    port = int(os.getenv("API_PORT", "8000"))
+    
+    uvicorn.run(
+        "main:app",
+        host=host,
+        port=port,
+        reload=os.getenv("API_RELOAD", "false").lower() == "true",
+    )
 

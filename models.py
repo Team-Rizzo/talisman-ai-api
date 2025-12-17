@@ -1,148 +1,239 @@
 """
-Pydantic models for API v2 requests and responses.
+Pydantic models for Talisman AI API.
+
+These models correspond to the Prisma schema and are used for
+request/response validation and serialization.
 """
 
-from pydantic import BaseModel, Field, field_validator
-from typing import Dict, Optional, List
-from dateutil.parser import isoparse
-from validation_utils import norm_text, norm_author
+from datetime import datetime
+from typing import Optional, List
+from pydantic import BaseModel, Field
 
 
-def parse_unix(ts) -> Optional[int]:
-    """
-    Parse timestamp from various formats into unix seconds.
+# ============================================================================
+# User Models
+# ============================================================================
+
+class UserBase(BaseModel):
+    """Base user model with common fields."""
+    id: str
+    username: str
+    screen_name: str = Field(alias="screenName")
+    following_count: int = 0
+    followers_count: int = 0
     
-    Accepts:
-    - ISO-8601 strings (e.g., "2024-01-01T12:00:00Z")
-    - Unix timestamps as int or float (seconds)
-    - Unix timestamps in milliseconds (values > 1e12 are auto-converted)
+    class Config:
+        populate_by_name = True
+
+
+class UserCreate(BaseModel):
+    """Model for creating a new user."""
+    id: str
+    username: str
+    screen_name: str
+    following_count: int = 0
+    followers_count: int = 0
+
+
+class User(UserBase):
+    """Full user model for responses."""
+    pass
+
+
+# ============================================================================
+# Tweet Models
+# ============================================================================
+
+class TweetBase(BaseModel):
+    """Base tweet model with common fields."""
+    id: str
+    created_at: datetime = Field(alias="createdAt")
+    text: str
+    user_id: str = Field(alias="userId")
+    timestamp: datetime
+    sentiment: Optional[str] = None
     
-    Returns:
-        Unix timestamp in seconds, or None if parsing fails
-    """
-    if ts is None:
-        return None
-    if isinstance(ts, (int, float)):
-        v = float(ts)
-        if v > 1e12:  # Likely milliseconds
-            v /= 1000.0
-        return int(v)
-    if isinstance(ts, str):
-        try:
-            return int(isoparse(ts).timestamp())
-        except Exception:
-            return None
-    return None
+    class Config:
+        populate_by_name = True
 
 
-class PostSubmission(BaseModel):
-    """
-    Submission model from miners (same as v1).
+class TweetCreate(BaseModel):
+    """Model for creating a new tweet."""
+    id: str
+    created_at: datetime
+    text: str
+    user_id: str
+    timestamp: datetime
+    sentiment: Optional[str] = None
+
+
+class Tweet(TweetBase):
+    """Full tweet model for responses."""
+    insertion_timestamp: datetime = Field(alias="insertionTimestamp")
     
-    Data normalization happens automatically via field validators:
-    - content: Normalized text (NFC unicode, normalized whitespace)
-    - date: Parsed to unix seconds (handles ISO strings, milliseconds, etc.)
-    - author: Normalized (lowercase, stripped)
+    class Config:
+        populate_by_name = True
+
+
+class TweetWithUser(Tweet):
+    """Tweet model with nested user information."""
+    user: User
+
+
+# ============================================================================
+# Scoring Models
+# ============================================================================
+
+class ScoringBase(BaseModel):
+    """Base scoring model with common fields."""
+    id: str
+    tweet_id: str = Field(alias="tweetId")
+    status: str = "pending"
     
-    This ensures the validator receives clean, consistent data.
-    """
-    miner_hotkey: str = Field(..., description="Bittensor miner hotkey (string id)")
-    post_id: str
-    content: str
-    date: int = Field(..., gt=0, description="Unix timestamp in seconds (must be positive, valid timestamp)")
-    author: str
-    account_age: int
-    retweets: int
-    likes: int
-    responses: int
-    followers: int = Field(default=0, description="Author's follower count")
-    tokens: Dict[str, float]  # e.g., {"omron": 0.7, "data_universe": 0.4, "bounty_hunter": 0.0} - relevance scores 0.0 to 1.0
-    sentiment: float = Field(..., ge=-1.0, le=1.0, description="Sentiment score from -1.0 (very bearish) to 1.0 (very bullish)")
-    score: float = Field(..., ge=0.0, le=1.0, description="Post score from miner (0.0 to 1.0) - calculated by miner using score_post_entry")
-
-    @field_validator('content', mode='before')
-    @classmethod
-    def normalize_content(cls, v) -> str:
-        """Normalize text content for consistent comparison."""
-        if not isinstance(v, str):
-            raise ValueError("content must be a string")
-        normalized = norm_text(v)
-        if not normalized:
-            raise ValueError("content cannot be empty after normalization")
-        return normalized
-
-    @field_validator('date', mode='before')
-    @classmethod
-    def parse_date(cls, v) -> int:
-        """
-        Parse date from various formats (ISO string, unix seconds, milliseconds) 
-        into unix seconds.
-        """
-        parsed = parse_unix(v)
-        if parsed is None:
-            raise ValueError(f"date must be a valid timestamp (got {type(v).__name__}: {v})")
-        if parsed <= 0:
-            raise ValueError(f"date must be positive (got {parsed})")
-        return parsed
-
-    @field_validator('author', mode='before')
-    @classmethod
-    def normalize_author(cls, v) -> str:
-        """Normalize author username (lowercase, strip)."""
-        if not isinstance(v, str):
-            raise ValueError("author must be a string")
-        normalized = norm_author(v)
-        if not normalized:
-            raise ValueError("author cannot be empty after normalization")
-        return normalized
-
-    @field_validator('tokens')
-    @classmethod
-    def validate_token_values(cls, v: Dict[str, float]) -> Dict[str, float]:
-        """Validate that all token relevance scores are in [0.0, 1.0] range."""
-        if not isinstance(v, dict):
-            raise ValueError("tokens must be a dictionary")
-        if not v:
-            raise ValueError("tokens cannot be empty - post must have relevance to at least one subnet to be accepted")
-        for key, value in v.items():
-            if not isinstance(value, (int, float)):
-                raise ValueError(f"Token value for '{key}' must be a number, got {type(value).__name__}")
-            if not (0.0 <= float(value) <= 1.0):
-                raise ValueError(f"Token value for '{key}' must be between 0.0 and 1.0, got {value}")
-        # Check that at least one token has relevance > 0.0
-        max_relevance = max(float(value) for value in v.values())
-        if max_relevance <= 0.0:
-            raise ValueError("Post must have relevance to at least one subnet (at least one token value must be > 0.0)")
-        return v
+    class Config:
+        populate_by_name = True
 
 
-# ---- Validation Payload (v2): individual post validation ----
-class ValidationPayload(BaseModel):
-    """Payload returned to validators when they GET a validation request."""
-    validation_id: str  # Unique ID for this validation request
-    miner_hotkey: str
-    post: Dict  # The post to validate (all fields from PostSubmission)
-    selected_at: int  # Unix timestamp when this post was selected for validation
+class ScoringCreate(BaseModel):
+    """Model for creating a scoring entry."""
+    tweet_id: str
+    status: str = "pending"
+    validator_hotkey: Optional[str] = None
 
 
-class ValidationPayloadsResponse(BaseModel):
-    """Response containing multiple validation payloads."""
-    available: bool
-    payloads: List[ValidationPayload]  # One per hotkey (all available hotkeys)
-    count: int  # Number of payloads returned
+class ScoringUpdate(BaseModel):
+    """Model for updating scoring status."""
+    status: str
+    validator_hotkey: Optional[str] = None
 
 
-class ValidationResult(BaseModel):
-    """Result submitted by validators after validating a post."""
-    validator_hotkey: str
-    validation_id: str  # The validation_id from the ValidationPayload
-    miner_hotkey: str
-    success: bool  # True if validation passed, False if validation failed
-    failure_reason: Optional[Dict] = None  # Failure reason if success=False
+class Scoring(ScoringBase):
+    """Full scoring model for responses."""
+    start_time: Optional[datetime] = Field(None, alias="startTime")
+    validator_hotkey: Optional[str] = Field(None, alias="validatorHotkey")
 
 
-class ValidationResultsPayload(BaseModel):
-    """Payload containing multiple validation results."""
-    validator_hotkey: str
-    results: List[ValidationResult]  # Multiple validation results (one per payload received)
+class ScoringWithTweet(Scoring):
+    """Scoring model with nested tweet information."""
+    tweet: Tweet
+
+
+# ============================================================================
+# Penalty Models
+# ============================================================================
+
+class PenaltyBase(BaseModel):
+    """Base penalty model with common fields."""
+    hotkey: str
+    reason: str
+    
+    class Config:
+        populate_by_name = True
+
+
+class PenaltyCreate(BaseModel):
+    """Model for creating a penalty."""
+    hotkey: str
+    reason: str
+
+
+class Penalty(PenaltyBase):
+    """Full penalty model for responses."""
+    id: str
+    timestamp: datetime
+
+
+class PenaltyBulkCreate(BaseModel):
+    """Model for creating multiple penalties at once."""
+    penalties: List[PenaltyCreate]
+
+
+# ============================================================================
+# Reward Models
+# ============================================================================
+
+class RewardBase(BaseModel):
+    """Base reward model with common fields."""
+    start_block: int = Field(alias="startBlock")
+    stop_block: int = Field(alias="stopBlock")
+    hotkey: str
+    points: float
+    
+    class Config:
+        populate_by_name = True
+
+
+class RewardCreate(BaseModel):
+    """Model for creating a reward."""
+    start_block: int
+    stop_block: int
+    hotkey: str
+    points: float
+
+
+class Reward(RewardBase):
+    """Full reward model for responses."""
+    id: str
+
+
+class RewardBulkCreate(BaseModel):
+    """Model for creating multiple rewards at once."""
+    rewards: List[RewardCreate]
+
+
+# ============================================================================
+# Blacklisted Hotkey Models
+# ============================================================================
+
+class BlacklistedHotkeyBase(BaseModel):
+    """Base blacklisted hotkey model."""
+    hotkey: str
+
+
+class BlacklistedHotkeyCreate(BlacklistedHotkeyBase):
+    """Model for creating a blacklisted hotkey."""
+    pass
+
+
+class BlacklistedHotkey(BlacklistedHotkeyBase):
+    """Full blacklisted hotkey model for responses."""
+    pass
+
+
+class BlacklistedHotkeyBulkCreate(BaseModel):
+    """Model for creating multiple blacklisted hotkeys at once."""
+    hotkeys: List[str]
+
+
+# ============================================================================
+# Response Models
+# ============================================================================
+
+class TweetsForScoringResponse(BaseModel):
+    """Response model for getting tweets for scoring."""
+    tweets: List[TweetWithUser]
+    count: int
+
+
+class CompletedTweetSubmission(BaseModel):
+    """Model for submitting a completed scored tweet."""
+    tweet_id: str
+    sentiment: str
+
+
+class CompletedTweetsSubmission(BaseModel):
+    """Model for submitting multiple completed scored tweets."""
+    completed_tweets: List[CompletedTweetSubmission]
+
+
+class SubmissionResponse(BaseModel):
+    """Generic response for submission endpoints."""
+    success: bool
+    message: str
+    count: int = 0
+
+
+class ErrorResponse(BaseModel):
+    """Error response model."""
+    detail: str
 
