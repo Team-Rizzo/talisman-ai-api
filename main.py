@@ -22,7 +22,7 @@ from prisma import Prisma
 
 # Local imports
 from models import (
-    Tweet, TweetWithUser, User,
+    Tweet, TweetWithAuthor, Account, TweetAnalysis,
     Scoring, ScoringUpdate,
     Penalty, PenaltyCreate, PenaltyBulkCreate,
     Reward, RewardCreate, RewardBulkCreate,
@@ -180,7 +180,14 @@ async def get_unscored_tweets(
         # Find tweets with pending scoring status
         scorings = await prisma.scoring.find_many(
             where={"status": "pending"},
-            include={"tweet": {"include": {"user": True}}},
+            include={
+                "tweet": {
+                    "include": {
+                        "author": True,
+                        "analysis": True,
+                    }
+                }
+            },
             take=limit,
         )
         
@@ -198,30 +205,67 @@ async def get_unscored_tweets(
             },
         )
         
-        # Build response with tweet and user data
-        tweets_with_users = []
+        # Build response with tweet and author data
+        tweets_with_authors = []
         for scoring in scorings:
-            if scoring.tweet and scoring.tweet.user:
-                tweet_data = TweetWithUser(
-                    id=scoring.tweet.id,
-                    createdAt=scoring.tweet.createdAt,
-                    text=scoring.tweet.text,
-                    userId=scoring.tweet.userId,
-                    timestamp=scoring.tweet.timestamp,
-                    sentiment=scoring.tweet.sentiment,
-                    insertionTimestamp=scoring.tweet.insertionTimestamp,
-                    user=User(
-                        id=scoring.tweet.user.id,
-                        username=scoring.tweet.user.username,
-                        screenName=scoring.tweet.user.screenName,
-                        following_count=scoring.tweet.user.following_count,
-                        followers_count=scoring.tweet.user.followers_count,
-                    ),
+            if scoring.tweet:
+                tweet = scoring.tweet
+                author_model = None
+                analysis_model = None
+                
+                if tweet.author:
+                    author_model = Account(
+                        id=tweet.author.id,
+                        name=tweet.author.name,
+                        screenName=tweet.author.screenName,
+                        userName=tweet.author.userName,
+                        location=tweet.author.location,
+                        description=tweet.author.description,
+                        verified=tweet.author.verified,
+                        isBlueVerified=tweet.author.isBlueVerified,
+                        followersCount=tweet.author.followersCount,
+                        followingCount=tweet.author.followingCount,
+                        statusesCount=tweet.author.statusesCount,
+                        profileImageUrl=tweet.author.profileImageUrl,
+                        createdAt=tweet.author.createdAt,
+                    )
+                
+                if tweet.analysis:
+                    analysis_model = TweetAnalysis(
+                        id=tweet.analysis.id,
+                        tweetId=tweet.analysis.tweetId,
+                        sentiment=tweet.analysis.sentiment,
+                        subnetId=tweet.analysis.subnetId,
+                        subnetName=tweet.analysis.subnetName,
+                        contentType=tweet.analysis.contentType,
+                        analyzedAt=tweet.analysis.analyzedAt,
+                    )
+                
+                tweet_data = TweetWithAuthor(
+                    id=tweet.id,
+                    type=tweet.type,
+                    url=tweet.url,
+                    text=tweet.text,
+                    lang=tweet.lang,
+                    retweetCount=tweet.retweetCount,
+                    replyCount=tweet.replyCount,
+                    likeCount=tweet.likeCount,
+                    quoteCount=tweet.quoteCount,
+                    viewCount=tweet.viewCount,
+                    bookmarkCount=tweet.bookmarkCount,
+                    isReply=tweet.isReply,
+                    inReplyToId=tweet.inReplyToId,
+                    conversationId=tweet.conversationId,
+                    authorId=tweet.authorId,
+                    createdAt=tweet.createdAt,
+                    receivedAt=tweet.receivedAt,
+                    author=author_model,
+                    analysis=analysis_model,
                 )
-                tweets_with_users.append(tweet_data)
+                tweets_with_authors.append(tweet_data)
         
-        logger.info(f"Assigned {len(tweets_with_users)} tweets to validator {validator_hotkey}")
-        return TweetsForScoringResponse(tweets=tweets_with_users, count=len(tweets_with_users))
+        logger.info(f"Assigned {len(tweets_with_authors)} tweets to validator {validator_hotkey}")
+        return TweetsForScoringResponse(tweets=tweets_with_authors, count=len(tweets_with_authors))
     
     except Exception as e:
         logger.error(f"Error getting unscored tweets: {e}")
@@ -243,7 +287,7 @@ async def submit_completed_tweets(
     """
     Submit completed scored tweets.
     
-    Updates the scoring status to 'completed' and stores the sentiment for each tweet.
+    Updates the scoring status to 'completed' and stores the sentiment in TweetAnalysis.
     Only tweets assigned to the requesting validator can be completed.
     
     Only accessible by validators.
@@ -252,10 +296,20 @@ async def submit_completed_tweets(
         updated_count = 0
         
         for completed in submission.completed_tweets:
-            # Update the tweet's sentiment
-            await prisma.tweet.update(
-                where={"id": completed.tweet_id},
-                data={"sentiment": completed.sentiment},
+            # Create or update TweetAnalysis with the sentiment
+            await prisma.tweetanalysis.upsert(
+                where={"tweetId": completed.tweet_id},
+                data={
+                    "create": {
+                        "tweetId": completed.tweet_id,
+                        "sentiment": completed.sentiment,
+                        "analyzedAt": datetime.utcnow(),
+                    },
+                    "update": {
+                        "sentiment": completed.sentiment,
+                        "updatedAt": datetime.utcnow(),
+                    },
+                },
             )
             
             # Update scoring status to completed
@@ -362,6 +416,7 @@ async def get_rewards(
                 stopBlock=r.stopBlock,
                 hotkey=r.hotkey,
                 points=r.points,
+                createdAt=r.createdAt,
             )
             for r in rewards
         ]
@@ -482,7 +537,14 @@ async def get_blacklisted_hotkeys(
     """
     try:
         blacklisted = await prisma.blacklistedhotkey.find_many()
-        return [BlacklistedHotkey(hotkey=b.hotkey) for b in blacklisted]
+        return [
+            BlacklistedHotkey(
+                hotkey=b.hotkey,
+                reason=b.reason,
+                createdAt=b.createdAt,
+            )
+            for b in blacklisted
+        ]
     
     except Exception as e:
         logger.error(f"Error getting blacklisted hotkeys: {e}")
@@ -514,8 +576,13 @@ async def add_blacklisted_hotkeys(
             await prisma.blacklistedhotkey.upsert(
                 where={"hotkey": hotkey},
                 data={
-                    "create": {"hotkey": hotkey},
-                    "update": {},  # No update needed, just ensure it exists
+                    "create": {
+                        "hotkey": hotkey,
+                        "reason": submission.reason,
+                    },
+                    "update": {
+                        "reason": submission.reason,
+                    },
                 },
             )
             created_count += 1
@@ -594,4 +661,3 @@ if __name__ == "__main__":
         port=port,
         reload=os.getenv("API_RELOAD", "false").lower() == "true",
     )
-

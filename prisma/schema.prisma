@@ -1,10 +1,4 @@
-// Prisma schema for Talisman AI API
-// PostgreSQL database
-
-datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
-}
+// Unified X Archive + Talisman AI Database Schema
 
 generator client {
   provider             = "prisma-client-py"
@@ -12,76 +6,365 @@ generator client {
   recursive_type_depth = 5
 }
 
-model Tweet {
-  id                  String    @id @default(cuid())
-  createdAt           DateTime  @map("created_at")
-  text                String
-  userId              String    @map("user_id")
-  insertionTimestamp  DateTime  @default(now()) @map("insertion_timestamp")
-  timestamp           DateTime
-  sentiment           String?
-  like_count          Int       @default(0) @map("like_count")
-  retweet_count       Int       @default(0) @map("retweet_count")
-  reply_count         Int       @default(0) @map("reply_count")
-  quote_count         Int       @default(0) @map("quote_count")
-  url                 String?   @map("url")
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
 
+/// Twitter/X user accounts
+model Account {
+  id                BigInt    @id
+  name              String?
+  screenName        String    @map("screen_name")
+  userName          String?   @map("user_name")
+  location          String?
+  url               String?
+  description       String?
+  email             String?
+  protected         Boolean   @default(false)
+  verified          Boolean   @default(false)
+  isBlueVerified    Boolean   @default(false) @map("is_blue_verified")
+  followersCount    Int       @default(0) @map("followers_count")
+  followingCount    Int       @default(0) @map("following_count")
+  friendsCount      Int       @default(0) @map("friends_count")
+  favouritesCount   Int       @default(0) @map("favourites_count")
+  statusesCount     Int       @default(0) @map("statuses_count")
+  mediaCount        Int       @default(0) @map("media_count")
+  createdAt         DateTime? @map("created_at") @db.Timestamptz
+  profileBannerUrl  String?   @map("profile_banner_url")
+  profileImageUrl   String?   @map("profile_image_url")
+  canDm             Boolean   @default(false) @map("can_dm")
+  canMediaTag       Boolean   @default(true) @map("can_media_tag")
+  isTranslator      Boolean   @default(false) @map("is_translator")
+  isAutomated       Boolean   @default(false) @map("is_automated")
+  automatedBy       String?   @map("automated_by")
+  possiblySensitive Boolean   @default(false) @map("possibly_sensitive")
+  firstSeenAt       DateTime  @default(now()) @map("first_seen_at") @db.Timestamptz
+  lastUpdatedAt     DateTime  @default(now()) @map("last_updated_at") @db.Timestamptz
 
   // Relations
-  user                User      @relation(fields: [userId], references: [id])
-  scorings            Scoring[]
+  tweets            Tweet[]
+  monitoredAccount  MonitoredAccount?
+  relationships     Relationship[]
+
+  @@index([screenName], name: "idx_accounts_screen_name")
+  @@index([userName], name: "idx_accounts_user_name")
+  @@map("accounts")
+}
+
+/// Accounts being actively monitored for tweets via streaming
+model MonitoredAccount {
+  id          Int       @id @default(autoincrement())
+  screenName  String    @unique @map("screen_name")
+  accountId   BigInt?   @unique @map("account_id")
+  ruleId      String?   @map("rule_id")
+  ruleTag     String?   @map("rule_tag")
+  isActive    Boolean   @default(true) @map("is_active")
+  addedAt     DateTime  @default(now()) @map("added_at") @db.Timestamptz
+  lastTweetAt DateTime? @map("last_tweet_at") @db.Timestamptz
+
+  // Relations
+  account Account? @relation(fields: [accountId], references: [id])
+
+  @@index([screenName], name: "idx_monitored_screen_name")
+  @@index([isActive], name: "idx_monitored_active")
+  @@map("monitored_accounts")
+}
+
+/// Accounts whose followers/followings were imported
+model SourceAccount {
+  id          Int      @id @default(autoincrement())
+  screenName  String   @unique @map("screen_name")
+  processedAt DateTime @default(now()) @map("processed_at") @db.Timestamptz
+
+  @@map("source_accounts")
+}
+
+/// Follower/following relationships between accounts
+model Relationship {
+  id               Int      @id @default(autoincrement())
+  sourceAccount    String   @map("source_account")
+  targetAccountId  BigInt   @map("target_account_id")
+  relationshipType String   @map("relationship_type")
+  discoveredAt     DateTime @default(now()) @map("discovered_at") @db.Timestamptz
+
+  // Relations
+  targetAccount Account @relation(fields: [targetAccountId], references: [id])
+
+  @@unique([sourceAccount, targetAccountId, relationshipType])
+  @@index([sourceAccount], name: "idx_relationships_source")
+  @@index([targetAccountId], name: "idx_relationships_target")
+  @@index([relationshipType], name: "idx_relationships_type")
+  @@map("relationships")
+}
+
+/// Main tweets storage - raw API data only (source of truth)
+model Tweet {
+  id                 BigInt    @id
+  type               String    @default("tweet")
+  url                String?
+  text               String?
+  source             String?
+  lang               String?
   
+  // Engagement metrics
+  retweetCount       Int       @default(0) @map("retweet_count")
+  replyCount         Int       @default(0) @map("reply_count")
+  likeCount          Int       @default(0) @map("like_count")
+  quoteCount         Int       @default(0) @map("quote_count")
+  viewCount          Int       @default(0) @map("view_count")
+  bookmarkCount      Int       @default(0) @map("bookmark_count")
+  
+  // Reply/conversation info
+  isReply            Boolean   @default(false) @map("is_reply")
+  inReplyToId        BigInt?   @map("in_reply_to_id")
+  conversationId     BigInt?   @map("conversation_id")
+  inReplyToUserId    BigInt?   @map("in_reply_to_user_id")
+  inReplyToUsername  String?   @map("in_reply_to_username")
+  
+  // Author
+  authorId           BigInt?   @map("author_id")
+  
+  // Referenced tweets
+  quotedTweetId      BigInt?   @map("quoted_tweet_id")
+  retweetedTweetId   BigInt?   @map("retweeted_tweet_id")
+  
+  // Stream rule info
+  ruleId             String?   @map("rule_id")
+  ruleTag            String?   @map("rule_tag")
+  
+  // Card and place data (stored as JSON)
+  cardData           Json?     @map("card_data") @db.JsonB
+  placeData          Json?     @map("place_data") @db.JsonB
+  
+  // Timestamps
+  createdAt          DateTime? @map("created_at") @db.Timestamptz
+  receivedAt         DateTime  @default(now()) @map("received_at") @db.Timestamptz
+
+  // Relations
+  author             Account?  @relation(fields: [authorId], references: [id])
+  media              TweetMedia[]
+  mentions           TweetMention[]
+  hashtags           TweetHashtag[]
+  urls               TweetUrl[]
+  symbols            TweetSymbol[]
+  scorings           Scoring[]
+  analysis           TweetAnalysis?
+  
+  // Self-referencing relations
+  quotedTweet        Tweet?    @relation("QuotedTweet", fields: [quotedTweetId], references: [id])
+  quotedBy           Tweet[]   @relation("QuotedTweet")
+  retweetedTweet     Tweet?    @relation("RetweetedTweet", fields: [retweetedTweetId], references: [id])
+  retweetedBy        Tweet[]   @relation("RetweetedTweet")
+
+  @@index([authorId], name: "idx_tweets_author")
+  @@index([createdAt], name: "idx_tweets_created")
+  @@index([conversationId], name: "idx_tweets_conversation")
+  @@index([inReplyToId], name: "idx_tweets_in_reply_to")
+  @@index([quotedTweetId], name: "idx_tweets_quoted")
+  @@index([retweetedTweetId], name: "idx_tweets_retweeted")
+  @@index([ruleId], name: "idx_tweets_rule")
   @@map("tweets")
 }
 
-model Scoring {
-  id              String    @id @default(cuid())
-  tweetId         String    @map("tweet_id")
-  status          String    @default("pending") // pending, in_progress, completed
-  startTime       DateTime? @map("start_time")
-  validatorHotkey String?   @map("validator_hotkey")
+/// Tweet analysis/sentiment results - separate from raw tweet data
+/// Allows re-running analysis without modifying source tweet data
+model TweetAnalysis {
+  id                  Int       @id @default(autoincrement())
+  tweetId             BigInt    @unique @map("tweet_id")
   
+  // Sentiment analysis
+  sentiment           String?   // very_bullish, bullish, neutral, bearish, very_bearish
+  
+  // Subnet classification
+  subnetId            Int?      @map("subnet_id")
+  subnetName          String?   @map("subnet_name")
+  
+  // Content analysis
+  contentType         String?   @map("content_type")
+  technicalQuality    String?   @map("technical_quality")
+  marketAnalysis      String?   @map("market_analysis")
+  impactPotential     String?   @map("impact_potential")
+  relevanceConfidence String?   @map("relevance_confidence")
+  
+  // Full analysis data (JSON blob)
+  analysisData        Json?     @map("analysis_data") @db.JsonB
+  
+  // Timestamps
+  analyzedAt          DateTime  @default(now()) @map("analyzed_at") @db.Timestamptz
+  updatedAt           DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
   // Relations
-  tweet           Tweet     @relation(fields: [tweetId], references: [id], onDelete: Cascade)
-  
+  tweet               Tweet     @relation(fields: [tweetId], references: [id], onDelete: Cascade)
+
+  @@index([sentiment], name: "idx_tweet_analysis_sentiment")
+  @@index([subnetId], name: "idx_tweet_analysis_subnet")
+  @@index([analyzedAt], name: "idx_tweet_analysis_analyzed_at")
+  @@map("tweet_analysis")
+}
+
+/// Media attachments on tweets
+model TweetMedia {
+  id          Int     @id @default(autoincrement())
+  tweetId     BigInt  @map("tweet_id")
+  mediaId     String  @map("media_id")
+  mediaKey    String? @map("media_key")
+  type        String? // photo, video, animated_gif
+  url         String?
+  mediaUrl    String? @map("media_url")
+  displayUrl  String? @map("display_url")
+  expandedUrl String? @map("expanded_url")
+  width       Int?
+  height      Int?
+  durationMs  Int?    @map("duration_ms") // for video
+  altText     String? @map("alt_text")
+
+  // Relations
+  tweet Tweet @relation(fields: [tweetId], references: [id], onDelete: Cascade)
+
+  @@unique([tweetId, mediaId])
+  @@index([tweetId], name: "idx_tweet_media_tweet")
+  @@index([type], name: "idx_tweet_media_type")
+  @@map("tweet_media")
+}
+
+/// User mentions in tweets
+model TweetMention {
+  id         Int     @id @default(autoincrement())
+  tweetId    BigInt  @map("tweet_id")
+  userId     BigInt? @map("user_id")
+  screenName String  @map("screen_name")
+  name       String?
+  startIndex Int?    @map("start_index")
+  endIndex   Int?    @map("end_index")
+
+  // Relations
+  tweet Tweet @relation(fields: [tweetId], references: [id], onDelete: Cascade)
+
+  @@unique([tweetId, userId])
+  @@index([tweetId], name: "idx_tweet_mentions_tweet")
+  @@index([userId], name: "idx_tweet_mentions_user")
+  @@index([screenName], name: "idx_tweet_mentions_screen_name")
+  @@map("tweet_mentions")
+}
+
+/// Hashtags in tweets
+model TweetHashtag {
+  id         Int    @id @default(autoincrement())
+  tweetId    BigInt @map("tweet_id")
+  tag        String
+  startIndex Int?   @map("start_index")
+  endIndex   Int?   @map("end_index")
+
+  // Relations
+  tweet Tweet @relation(fields: [tweetId], references: [id], onDelete: Cascade)
+
+  @@unique([tweetId, tag])
+  @@index([tweetId], name: "idx_tweet_hashtags_tweet")
+  @@index([tag], name: "idx_tweet_hashtags_tag")
+  @@map("tweet_hashtags")
+}
+
+/// URLs in tweets
+model TweetUrl {
+  id          Int     @id @default(autoincrement())
+  tweetId     BigInt  @map("tweet_id")
+  url         String
+  expandedUrl String? @map("expanded_url")
+  displayUrl  String? @map("display_url")
+  startIndex  Int?    @map("start_index")
+  endIndex    Int?    @map("end_index")
+
+  // Relations
+  tweet Tweet @relation(fields: [tweetId], references: [id], onDelete: Cascade)
+
+  @@index([tweetId], name: "idx_tweet_urls_tweet")
+  @@map("tweet_urls")
+}
+
+/// Cashtags/symbols in tweets
+model TweetSymbol {
+  id         Int    @id @default(autoincrement())
+  tweetId    BigInt @map("tweet_id")
+  symbol     String
+  startIndex Int?   @map("start_index")
+  endIndex   Int?   @map("end_index")
+
+  // Relations
+  tweet Tweet @relation(fields: [tweetId], references: [id], onDelete: Cascade)
+
+  @@unique([tweetId, symbol])
+  @@index([tweetId], name: "idx_tweet_symbols_tweet")
+  @@index([symbol], name: "idx_tweet_symbols_symbol")
+  @@map("tweet_symbols")
+}
+
+/// Log of websocket stream events received
+model StreamEvent {
+  id         Int      @id @default(autoincrement())
+  eventType  String   @map("event_type")
+  ruleId     String?  @map("rule_id")
+  ruleTag    String?  @map("rule_tag")
+  tweetCount Int?     @map("tweet_count")
+  timestamp  BigInt?
+  receivedAt DateTime @default(now()) @map("received_at") @db.Timestamptz
+  rawPayload Json?    @map("raw_payload") @db.JsonB
+
+  @@index([eventType], name: "idx_stream_events_type")
+  @@index([receivedAt], name: "idx_stream_events_received")
+  @@map("stream_events")
+}
+
+/// Scoring records for tweet validation
+model Scoring {
+  id              Int       @id @default(autoincrement())
+  tweetId         BigInt    @map("tweet_id")
+  status          String    @default("pending") // pending, in_progress, completed
+  startTime       DateTime? @map("start_time") @db.Timestamptz
+  validatorHotkey String?   @map("validator_hotkey")
+  score           Float?
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  // Relations
+  tweet Tweet @relation(fields: [tweetId], references: [id], onDelete: Cascade)
+
+  @@index([tweetId], name: "idx_scoring_tweet")
+  @@index([status], name: "idx_scoring_status")
+  @@index([validatorHotkey], name: "idx_scoring_validator")
   @@map("scoring")
 }
 
-model User {
-  id          String   @id
-  username    String   @unique
-  screenName  String   @map("screen_name")
-  following_count   Int      @default(0)
-  followers_count   Int      @default(0)
-  
-  // Relations
-  tweets      Tweet[]
-  
-  @@map("users")
-}
-
+/// Validator penalties
 model Penalty {
-  id        String   @id @default(cuid())
+  id        Int      @id @default(autoincrement())
   hotkey    String
   reason    String
-  timestamp DateTime @default(now())
-  
+  timestamp DateTime @default(now()) @db.Timestamptz
+
+  @@index([hotkey], name: "idx_penalties_hotkey")
+  @@index([timestamp], name: "idx_penalties_timestamp")
   @@map("penalties")
 }
 
+/// Validator rewards
 model Reward {
-  id         String @id @default(cuid())
-  startBlock Int    @map("start_block")
-  stopBlock  Int    @map("stop_block")
+  id         Int      @id @default(autoincrement())
+  startBlock Int      @map("start_block")
+  stopBlock  Int      @map("stop_block")
   hotkey     String
   points     Float
-  
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  @@index([hotkey], name: "idx_rewards_hotkey")
+  @@index([startBlock, stopBlock], name: "idx_rewards_blocks")
   @@map("rewards")
 }
 
+/// Blacklisted validator hotkeys
 model BlacklistedHotkey {
-  hotkey String @id
-  
+  hotkey    String   @id
+  reason    String?
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
   @@map("blacklisted_hotkeys")
 }
-
