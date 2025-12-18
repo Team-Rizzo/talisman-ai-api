@@ -332,19 +332,38 @@ async def submit_completed_tweets(
         updated_count = 0
         
         for completed in submission.completed_tweets:
-            # Create or update TweetAnalysis with the sentiment
+            # Create or update TweetAnalysis with sentiment + optional richer classification columns.
+            analysis_create = {
+                "tweetId": completed.tweet_id,
+                "sentiment": completed.sentiment,
+                "analyzedAt": datetime.utcnow(),
+            }
+            analysis_update = {
+                "sentiment": completed.sentiment,
+                "updatedAt": datetime.utcnow(),
+                "analyzedAt": datetime.utcnow(),
+            }
+
+            # Optional classification columns (only set if provided by the validator).
+            optional_fields = {
+                "subnetId": completed.subnet_id,
+                "subnetName": completed.subnet_name,
+                "contentType": completed.content_type,
+                "technicalQuality": completed.technical_quality,
+                "marketAnalysis": completed.market_analysis,
+                "impactPotential": completed.impact_potential,
+                "relevanceConfidence": completed.relevance_confidence,
+            }
+            for k, v in optional_fields.items():
+                if v is not None:
+                    analysis_create[k] = v
+                    analysis_update[k] = v
+
             await prisma.tweetanalysis.upsert(
                 where={"tweetId": completed.tweet_id},
                 data={
-                    "create": {
-                        "tweetId": completed.tweet_id,
-                        "sentiment": completed.sentiment,
-                        "analyzedAt": datetime.utcnow(),
-                    },
-                    "update": {
-                        "sentiment": completed.sentiment,
-                        "updatedAt": datetime.utcnow(),
-                    },
+                    "create": analysis_create,
+                    "update": analysis_update,
                 },
             )
             
