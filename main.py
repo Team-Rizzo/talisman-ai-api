@@ -188,63 +188,67 @@ async def get_unscored_tweets(
     Only accessible by validators.
     """
     try:
-        # Find tweets that:
-        # 1. Have no scorings OR no analysis
-        # 2. AND don't have in_progress or completed scorings
-        tweets = await prisma.tweet.find_many(
-            where={
-                "OR": [
-                    {"scorings": {"none": {}}},  # No scorings at all
-                    {"analysis": {"is": None}},  # No analysis
-                ],
-                "NOT": {
-                    "scorings": {
-                        "some": {
-                            "status": {"in": ["in_progress", "completed"]}
-                        }
-                    }
-                }
-            },
-            include={
-                "author": True,
-                "analysis": True,
-                "scorings": True,
-            },
-            take=limit,
-        )
-        
-        if not tweets:
+        # Soft-lease TTL in seconds (default: 15 minutes). We reuse scoring.startTime as lease time.
+        lease_ttl_seconds = int(os.getenv("SCORING_LEASE_TTL_SECONDS", "900"))
+
+        # Reclaim + claim must be atomic to avoid double-leasing under concurrency.
+        async with prisma.tx() as tx:
+            # 1) Reclaim expired leases: in_progress older than TTL → pending (unassigned).
+            await tx.execute_raw(
+                """
+                UPDATE scoring
+                SET status = 'pending',
+                    start_time = NULL,
+                    validator_hotkey = NULL
+                WHERE status = 'in_progress'
+                  AND start_time IS NOT NULL
+                  AND start_time < (NOW() AT TIME ZONE 'utc') - (MAKE_INTERVAL(secs => $1));
+                """,
+                lease_ttl_seconds,
+            )
+
+            # 2) Atomically claim up to `limit` pending rows using row locks.
+            claimed = await tx.query_raw(
+                """
+                WITH picked AS (
+                    SELECT id, tweet_id
+                    FROM scoring
+                    WHERE status = 'pending'
+                    ORDER BY created_at ASC, id ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT $1
+                )
+                UPDATE scoring s
+                SET status = 'in_progress',
+                    start_time = (NOW() AT TIME ZONE 'utc'),
+                    validator_hotkey = $2
+                FROM picked
+                WHERE s.id = picked.id
+                RETURNING picked.tweet_id;
+                """,
+                limit,
+                validator_hotkey,
+            )
+
+        tweet_ids = [row["tweet_id"] for row in (claimed or [])]
+        if not tweet_ids:
             return TweetsForScoringResponse(tweets=[], count=0)
-        
-        # For each tweet, create or update scoring to in_progress
-        for tweet in tweets:
-            if not tweet.scorings:
-                # No scoring exists, create one with in_progress status
-                await prisma.scoring.create(
-                    data={
-                        "tweetId": tweet.id,
-                        "status": "in_progress",
-                        "startTime": datetime.utcnow(),
-                        "validatorHotkey": validator_hotkey,
-                    }
-                )
-            else:
-                # Has pending scoring(s), update them to in_progress
-                await prisma.scoring.update_many(
-                    where={"tweetId": tweet.id, "status": "pending"},
-                    data={
-                        "status": "in_progress",
-                        "startTime": datetime.utcnow(),
-                        "validatorHotkey": validator_hotkey,
-                    },
-                )
-        
-        # Build response with tweet and author data
+
+        # Fetch the claimed tweets + nested author/analysis for response.
+        tweets = await prisma.tweet.find_many(
+            where={"id": {"in": tweet_ids}},
+            include={"author": True, "analysis": True},
+        )
+
+        # Preserve claim order (find_many doesn't guarantee ordering by input list).
+        tweets_by_id = {t.id: t for t in tweets}
+        ordered = [tweets_by_id.get(tid) for tid in tweet_ids if tid in tweets_by_id]
+
         tweets_with_authors = []
-        for tweet in tweets:
+        for tweet in ordered:
             author_model = None
             analysis_model = None
-            
+
             if tweet.author:
                 author_model = Account(
                     id=tweet.author.id,
@@ -261,7 +265,7 @@ async def get_unscored_tweets(
                     profileImageUrl=tweet.author.profileImageUrl,
                     createdAt=tweet.author.createdAt,
                 )
-            
+
             if tweet.analysis:
                 analysis_model = TweetAnalysis(
                     id=tweet.analysis.id,
@@ -272,7 +276,7 @@ async def get_unscored_tweets(
                     contentType=tweet.analysis.contentType,
                     analyzedAt=tweet.analysis.analyzedAt,
                 )
-            
+
             tweet_data = TweetWithAuthor(
                 id=tweet.id,
                 type=tweet.type,
@@ -295,10 +299,10 @@ async def get_unscored_tweets(
                 analysis=analysis_model,
             )
             tweets_with_authors.append(tweet_data)
-        
-        logger.info(f"Assigned {len(tweets_with_authors)} tweets to validator {validator_hotkey}")
+
+        logger.info(f"Leased {len(tweets_with_authors)} tweet(s) to validator {validator_hotkey}")
         return TweetsForScoringResponse(tweets=tweets_with_authors, count=len(tweets_with_authors))
-    
+
     except Exception as e:
         logger.error(f"Error getting unscored tweets: {e}")
         raise HTTPException(
@@ -344,11 +348,12 @@ async def submit_completed_tweets(
                 },
             )
             
-            # Update scoring status to completed
+            # Update scoring status to completed (only if still leased to this validator).
             result = await prisma.scoring.update_many(
                 where={
                     "tweetId": completed.tweet_id,
                     "validatorHotkey": validator_hotkey,
+                    "status": "in_progress",
                 },
                 data={"status": "completed"},
             )

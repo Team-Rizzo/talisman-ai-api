@@ -331,6 +331,7 @@ model Scoring {
   @@index([tweetId], name: "idx_scoring_tweet")
   @@index([status], name: "idx_scoring_status")
   @@index([validatorHotkey], name: "idx_scoring_validator")
+  @@index([status, startTime], name: "idx_scoring_status_start_time")
   @@map("scoring")
 }
 
