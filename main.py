@@ -18,6 +18,7 @@ from typing import List, Optional
 
 from fastapi import FastAPI, Depends, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from prisma import Prisma
 
 # Local imports
@@ -97,6 +98,40 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ============================================================================
+# API Version Deprecation Shims
+# ============================================================================
+
+V2_DEPRECATION_MESSAGE = os.getenv(
+    "V2_DEPRECATION_MESSAGE",
+    "The /v2 API is deprecated. Please update your code.",
+)
+
+
+@app.api_route("/v2", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
+@app.api_route("/v2/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
+async def v2_catchall(request: Request, path: str = ""):
+    """
+    Catch-all for legacy clients still calling /v2/*.
+
+    We intentionally do not require authentication here so callers get a clear upgrade message
+    rather than an auth error.
+    """
+    return JSONResponse(
+        status_code=status.HTTP_410_GONE,
+        content={
+            "error": "deprecated_api_version",
+            "message": V2_DEPRECATION_MESSAGE,
+            "requested_path": request.url.path,
+            "method": request.method,
+        },
+        headers={
+            # Informational headers that some clients/monitors use for deprecations.
+            "Deprecation": "true",
+        },
+    )
 
 
 # ============================================================================
