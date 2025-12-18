@@ -14,6 +14,7 @@ import threading
 import json
 import os
 from pathlib import Path
+
 import bittensor as bt
 
 logger = logging.getLogger(__name__)
@@ -30,18 +31,36 @@ except ImportError:
 # Network configuration from environment variables
 NETWORK = os.getenv("BT_NETWORK", "test")
 NETUID = int(os.getenv("SUBNET_UID", "45"))
-STAKE_THRESHOLD = 20000  # Minimum stake required for validators
+# Minimum stake required for validators.
+# Make this env-driven so testnet/local can run without requiring large stake.
+# Defaults to the previous hard-coded value (20000).
+STAKE_THRESHOLD = int(os.getenv("STAKE_THRESHOLD", "20000"))
 
-# Manual hotkeys for LOCAL TESTING ONLY (only active when ALLOW_MANUAL_HOTKEYS=true).
+# Manual hotkeys for LOCAL/TESTNET TESTING ONLY (only active when ALLOW_MANUAL_HOTKEYS=true).
 # Do NOT enable ALLOW_MANUAL_HOTKEYS in production environments.
 # NOTE: Even when enabled, manual miners are still subject to the blacklist.
 ALLOW_MANUAL_HOTKEYS = os.getenv("ALLOW_MANUAL_HOTKEYS", "false").lower() == "true"
-MANUAL_VALIDATOR_HOTKEYS = [
+
+def _parse_hotkey_list(env_key: str) -> List[str]:
+    """
+    Parse comma-separated SS58 hotkeys from an env var.
+    Returns [] if unset/empty.
+    """
+    raw = os.getenv(env_key, "").strip()
+    if not raw:
+        return []
+    return [hk.strip() for hk in raw.split(",") if hk.strip()]
+
+# Allow overriding manual hotkeys via env. Keep the previous hard-coded defaults as fallback.
+_DEFAULT_MANUAL_VALIDATOR_HOTKEYS = [
     "5E2Wu8SspFHdKe1BRvfM5CpSxcjQfzpQxYKGVEYK52G4mbDv",
 ]
-MANUAL_MINER_HOTKEYS = [
+_DEFAULT_MANUAL_MINER_HOTKEYS = [
     "5GUDZqzmvTQ1UiTUoFBS96USxsSjF6GQnnL4pnNhf7AmWL7c",
 ]
+
+MANUAL_VALIDATOR_HOTKEYS = _parse_hotkey_list("MANUAL_VALIDATOR_HOTKEYS") or _DEFAULT_MANUAL_VALIDATOR_HOTKEYS
+MANUAL_MINER_HOTKEYS = _parse_hotkey_list("MANUAL_MINER_HOTKEYS") or _DEFAULT_MANUAL_MINER_HOTKEYS
 
 # Blacklist configuration
 # Blacklisted hotkey prefixes are configured via BLACKLISTED_HOTKEY_PREFIXES environment variable (comma-separated)
@@ -181,7 +200,7 @@ def get_miner_hotkeys() -> List[str]:
             current_time - _MINER_CACHE_TIMESTAMP >= _CACHE_DURATION_SECONDS):
             try:
                 logger.info("Refreshing miner hotkeys cache from metagraph")
-                sub = bt.subtensor(network=NETWORK)
+                sub = bt.Subtensor(network=NETWORK)
                 mg = sub.metagraph(NETUID)
                 # lite sync is fine; we don't need recency for miners
                 mg.sync(subtensor=sub, lite=True)
@@ -235,7 +254,7 @@ def get_validator_data() -> List[Dict[str, str]]:
             current_time - _VALIDATOR_CACHE_TIMESTAMP >= _CACHE_DURATION_SECONDS):
             try:
                 logger.info("Refreshing validator hotkeys cache from metagraph")
-                sub = bt.subtensor(network=NETWORK)
+                sub = bt.Subtensor(network=NETWORK)
                 mg = sub.metagraph(NETUID)
                 # lite sync is fine; we don't need recency for validators
                 mg.sync(subtensor=sub, lite=True)
