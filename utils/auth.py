@@ -143,7 +143,7 @@ def create_auth_message(timestamp: Optional[float] = None) -> str:
         timestamp = time.time()
     return f"talisman-ai-auth:{int(timestamp)}"
 
-def sign_message(wallet: bt.wallet, message: str) -> str:
+def sign_message(wallet: "bt.Wallet", message: str) -> str:
     """Sign a message with the wallet's hotkey"""
     signature = wallet.hotkey.sign(message)
     return signature.hex()
@@ -220,7 +220,7 @@ def verify_auth_request(auth_request: AuthRequest, auth_config: AuthConfig) -> b
 class AuthenticatedClient:
     """Client class for making authenticated requests"""
     
-    def __init__(self, wallet: bt.wallet):
+    def __init__(self, wallet: "bt.Wallet"):
         self.wallet = wallet
         self.ss58_address = wallet.hotkey.ss58_address
         

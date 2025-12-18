@@ -48,10 +48,10 @@ def get_current_block() -> int:
         try:
             # Reuse subtensor instance if available, otherwise create new one
             if _subtensor_instance is None:
-                _subtensor_instance = bt.subtensor(network=NETWORK)
+                _subtensor_instance = bt.Subtensor(network=NETWORK)
             
             # Try to get block with error handling
-            # Note: bt.subtensor.get_current_block() may hang on network issues
+            # Note: subtensor.get_current_block() may hang on network issues
             # We rely on the cache to prevent repeated slow calls
             try:
                 new_block = _subtensor_instance.get_current_block()

@@ -115,9 +115,16 @@ async def get_validator_hotkey(request: Request) -> str:
     
     Raises HTTPException if authentication fails.
     """
-    # Extract auth from headers
+    # If auth is disabled (local/testing), allow requests without headers.
+    # We still try to read a hotkey from headers if present for attribution.
+    if not auth_config.enabled:
+        auth_request = extract_auth_from_headers(request)
+        if auth_request and auth_request.ss58_address:
+            return auth_request.ss58_address
+        return "unauthenticated"
+
+    # Extract auth from headers (required when auth is enabled)
     auth_request = extract_auth_from_headers(request)
-    
     if auth_request is None:
         logger.warning("Missing authentication headers")
         raise HTTPException(
