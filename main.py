@@ -169,100 +169,125 @@ async def get_unscored_tweets(
     validator_hotkey: str = Depends(get_validator_hotkey),
 ):
     """
-    Get tweets that haven't been started for scoring yet.
+    Get tweets that need scoring.
     
-    Returns up to `limit` tweets (default 3) that have a scoring status of 'pending'.
-    Marks the returned tweets as 'in_progress' and assigns them to the requesting validator.
+    Returns up to `limit` tweets (default 3) that either:
+    - Have no scoring records at all, or
+    - Have no TweetAnalysis record
+    
+    Excludes tweets that already have an 'in_progress' or 'completed' scoring.
+    Creates a new scoring record (set to 'in_progress') for tweets without one.
     
     Only accessible by validators.
     """
     try:
-        # Find tweets with pending scoring status
-        scorings = await prisma.scoring.find_many(
-            where={"status": "pending"},
-            include={
-                "tweet": {
-                    "include": {
-                        "author": True,
-                        "analysis": True,
+        # Find tweets that:
+        # 1. Have no scorings OR no analysis
+        # 2. AND don't have in_progress or completed scorings
+        tweets = await prisma.tweet.find_many(
+            where={
+                "OR": [
+                    {"scorings": {"none": {}}},  # No scorings at all
+                    {"analysis": {"is": None}},  # No analysis
+                ],
+                "NOT": {
+                    "scorings": {
+                        "some": {
+                            "status": {"in": ["in_progress", "completed"]}
+                        }
                     }
                 }
+            },
+            include={
+                "author": True,
+                "analysis": True,
+                "scorings": True,
             },
             take=limit,
         )
         
-        if not scorings:
+        if not tweets:
             return TweetsForScoringResponse(tweets=[], count=0)
         
-        # Mark these tweets as in_progress and assign to validator
-        tweet_ids = [s.tweetId for s in scorings]
-        await prisma.scoring.update_many(
-            where={"tweetId": {"in": tweet_ids}},
-            data={
-                "status": "in_progress",
-                "startTime": datetime.utcnow(),
-                "validatorHotkey": validator_hotkey,
-            },
-        )
+        # For each tweet, create or update scoring to in_progress
+        for tweet in tweets:
+            if not tweet.scorings:
+                # No scoring exists, create one with in_progress status
+                await prisma.scoring.create(
+                    data={
+                        "tweetId": tweet.id,
+                        "status": "in_progress",
+                        "startTime": datetime.utcnow(),
+                        "validatorHotkey": validator_hotkey,
+                    }
+                )
+            else:
+                # Has pending scoring(s), update them to in_progress
+                await prisma.scoring.update_many(
+                    where={"tweetId": tweet.id, "status": "pending"},
+                    data={
+                        "status": "in_progress",
+                        "startTime": datetime.utcnow(),
+                        "validatorHotkey": validator_hotkey,
+                    },
+                )
         
         # Build response with tweet and author data
         tweets_with_authors = []
-        for scoring in scorings:
-            if scoring.tweet:
-                tweet = scoring.tweet
-                author_model = None
-                analysis_model = None
-                
-                if tweet.author:
-                    author_model = Account(
-                        id=tweet.author.id,
-                        name=tweet.author.name,
-                        screenName=tweet.author.screenName,
-                        userName=tweet.author.userName,
-                        location=tweet.author.location,
-                        description=tweet.author.description,
-                        verified=tweet.author.verified,
-                        isBlueVerified=tweet.author.isBlueVerified,
-                        followersCount=tweet.author.followersCount,
-                        followingCount=tweet.author.followingCount,
-                        statusesCount=tweet.author.statusesCount,
-                        profileImageUrl=tweet.author.profileImageUrl,
-                        createdAt=tweet.author.createdAt,
-                    )
-                
-                if tweet.analysis:
-                    analysis_model = TweetAnalysis(
-                        id=tweet.analysis.id,
-                        tweetId=tweet.analysis.tweetId,
-                        sentiment=tweet.analysis.sentiment,
-                        subnetId=tweet.analysis.subnetId,
-                        subnetName=tweet.analysis.subnetName,
-                        contentType=tweet.analysis.contentType,
-                        analyzedAt=tweet.analysis.analyzedAt,
-                    )
-                
-                tweet_data = TweetWithAuthor(
-                    id=tweet.id,
-                    type=tweet.type,
-                    url=tweet.url,
-                    text=tweet.text,
-                    lang=tweet.lang,
-                    retweetCount=tweet.retweetCount,
-                    replyCount=tweet.replyCount,
-                    likeCount=tweet.likeCount,
-                    quoteCount=tweet.quoteCount,
-                    viewCount=tweet.viewCount,
-                    bookmarkCount=tweet.bookmarkCount,
-                    isReply=tweet.isReply,
-                    inReplyToId=tweet.inReplyToId,
-                    conversationId=tweet.conversationId,
-                    authorId=tweet.authorId,
-                    createdAt=tweet.createdAt,
-                    receivedAt=tweet.receivedAt,
-                    author=author_model,
-                    analysis=analysis_model,
+        for tweet in tweets:
+            author_model = None
+            analysis_model = None
+            
+            if tweet.author:
+                author_model = Account(
+                    id=tweet.author.id,
+                    name=tweet.author.name,
+                    screenName=tweet.author.screenName,
+                    userName=tweet.author.userName,
+                    location=tweet.author.location,
+                    description=tweet.author.description,
+                    verified=tweet.author.verified,
+                    isBlueVerified=tweet.author.isBlueVerified,
+                    followersCount=tweet.author.followersCount,
+                    followingCount=tweet.author.followingCount,
+                    statusesCount=tweet.author.statusesCount,
+                    profileImageUrl=tweet.author.profileImageUrl,
+                    createdAt=tweet.author.createdAt,
                 )
-                tweets_with_authors.append(tweet_data)
+            
+            if tweet.analysis:
+                analysis_model = TweetAnalysis(
+                    id=tweet.analysis.id,
+                    tweetId=tweet.analysis.tweetId,
+                    sentiment=tweet.analysis.sentiment,
+                    subnetId=tweet.analysis.subnetId,
+                    subnetName=tweet.analysis.subnetName,
+                    contentType=tweet.analysis.contentType,
+                    analyzedAt=tweet.analysis.analyzedAt,
+                )
+            
+            tweet_data = TweetWithAuthor(
+                id=tweet.id,
+                type=tweet.type,
+                url=tweet.url,
+                text=tweet.text,
+                lang=tweet.lang,
+                retweetCount=tweet.retweetCount,
+                replyCount=tweet.replyCount,
+                likeCount=tweet.likeCount,
+                quoteCount=tweet.quoteCount,
+                viewCount=tweet.viewCount,
+                bookmarkCount=tweet.bookmarkCount,
+                isReply=tweet.isReply,
+                inReplyToId=tweet.inReplyToId,
+                conversationId=tweet.conversationId,
+                authorId=tweet.authorId,
+                createdAt=tweet.createdAt,
+                receivedAt=tweet.receivedAt,
+                author=author_model,
+                analysis=analysis_model,
+            )
+            tweets_with_authors.append(tweet_data)
         
         logger.info(f"Assigned {len(tweets_with_authors)} tweets to validator {validator_hotkey}")
         return TweetsForScoringResponse(tweets=tweets_with_authors, count=len(tweets_with_authors))
