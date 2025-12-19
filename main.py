@@ -29,7 +29,13 @@ from models import (
     Reward, RewardCreate, RewardBulkCreate,
     BlacklistedHotkey, BlacklistedHotkeyCreate, BlacklistedHotkeyBulkCreate,
     TweetsForScoringResponse, CompletedTweetsSubmission,
-    SubmissionResponse, ErrorResponse,
+    SubmissionResponse, ErrorResponse, TaoPriceResponse,
+)
+from services.tao_price import (
+    start_refresh_task,
+    stop_refresh_task,
+    get_cached_price,
+    is_price_stale,
 )
 from utils.auth import (
     AuthRequest,
@@ -74,10 +80,14 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to connect to database: {e}")
         raise
     
+    # Start TAO price refresh background task
+    start_refresh_task()
+    
     yield
     
     # Shutdown
     logger.info("Shutting down Talisman AI API...")
+    stop_refresh_task()
     await prisma.disconnect()
     logger.info("Disconnected from database")
 
@@ -195,6 +205,46 @@ async def get_validator_hotkey(request: Request) -> str:
 async def health_check():
     """Health check endpoint."""
     return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+
+
+# ============================================================================
+# TAO Price Endpoint
+# ============================================================================
+
+@app.get(
+    "/price/tao-usd",
+    response_model=TaoPriceResponse,
+    responses={
+        401: {"model": ErrorResponse},
+        403: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+    },
+)
+async def get_tao_price(
+    validator_hotkey: str = Depends(get_validator_hotkey),
+):
+    """
+    Get the cached TAO/USD price.
+    
+    Returns the TAO price in USD, fetched from TaoStats and cached every 15 minutes.
+    If the cache is empty (e.g., on first startup before fetch completes), returns 503.
+    
+    Only accessible by validators.
+    """
+    cache = get_cached_price()
+    
+    if cache.price_usd is None or cache.last_updated is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="TAO price not yet available. Please retry shortly.",
+        )
+    
+    return TaoPriceResponse(
+        price_usd=cache.price_usd,
+        last_updated=cache.last_updated,
+        source=cache.source,
+        stale=is_price_stale(),
+    )
 
 
 # ============================================================================
