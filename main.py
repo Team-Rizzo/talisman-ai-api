@@ -13,6 +13,17 @@ Only validators with valid signatures are allowed to access the API.
 import os
 import logging
 from datetime import datetime
+
+
+class SuppressV2LogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        if "/v2/" in message or '"/v2 ' in message:
+            return False
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(SuppressV2LogFilter())
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
@@ -262,21 +273,19 @@ async def get_unscored_tweets(
 ):
     """
     Get tweets that need scoring.
-    
+
     Returns up to `limit` tweets (default 3) that either:
     - Have no scoring records at all, or
     - Have no TweetAnalysis record
-    
+
     Excludes tweets that already have an 'in_progress' or 'completed' scoring.
     Creates a new scoring record (set to 'in_progress') for tweets without one.
-    
+
     Only accessible by validators.
     """
     try:
-        # Soft-lease TTL in seconds (default: 15 minutes). We reuse scoring.startTime as lease time.
         lease_ttl_seconds = int(os.getenv("SCORING_LEASE_TTL_SECONDS", "900"))
 
-        # Reclaim + claim must be atomic to avoid double-leasing under concurrency.
         async with prisma.tx() as tx:
             # 1) Reclaim expired leases: in_progress older than TTL → pending (unassigned).
             await tx.execute_raw(
@@ -292,8 +301,12 @@ async def get_unscored_tweets(
                 lease_ttl_seconds,
             )
 
-            # 2) Atomically claim up to `limit` pending rows using row locks.
-            claimed = await tx.query_raw(
+            # 2) Pick from two sources:
+            #   A) Existing scoring records with status='pending'
+            #   B) Tweets with no scoring record and no analysis record
+
+            # A: Atomically claim up to `limit` pending scorings using row locks.
+            claimed_pending = await tx.query_raw(
                 """
                 WITH picked AS (
                     SELECT id, tweet_id
@@ -314,10 +327,43 @@ async def get_unscored_tweets(
                 limit,
                 validator_hotkey,
             )
+            tweet_ids_pending = [row["tweet_id"] for row in (claimed_pending or [])]
 
-        tweet_ids = [row["tweet_id"] for row in (claimed or [])]
-        if not tweet_ids:
-            return TweetsForScoringResponse(tweets=[], count=0)
+            # If need more, get up to `slots_left` tweets that have no scoring and no analysis
+            slots_left = max(0, limit - len(tweet_ids_pending))
+            tweet_ids_no_scoring = []
+            if slots_left > 0:
+                # Find tweets WITHOUT any scoring record AND WITHOUT an analysis record,
+                # and insert a new scoring record (status = 'in_progress') for each, returning IDs
+                # We must avoid race condition: Do all in one statement with row locking
+                inserted_rows = await tx.query_raw(
+                    """
+                    WITH unscored_tweets AS (
+                        SELECT t.id AS tweet_id
+                        FROM tweets t
+                        LEFT JOIN scoring s ON s.tweet_id = t.id
+                        LEFT JOIN tweet_analysis a ON a.tweet_id = t.id
+                        WHERE s.id IS NULL AND a.id IS NULL
+                        ORDER BY t.created_at ASC, t.id ASC
+                        LIMIT $1
+                        FOR UPDATE OF t SKIP LOCKED
+                    ), created_scoring AS (
+                        INSERT INTO scoring (tweet_id, status, start_time, validator_hotkey, created_at)
+                        SELECT tweet_id, 'in_progress', (NOW() AT TIME ZONE 'utc'), $2, (NOW() AT TIME ZONE 'utc')
+                        FROM unscored_tweets
+                        RETURNING tweet_id
+                    )
+                    SELECT tweet_id FROM created_scoring;
+                    """,
+                    slots_left,
+                    validator_hotkey,
+                )
+                tweet_ids_no_scoring = [row["tweet_id"] for row in (inserted_rows or [])]
+
+            # Combine all claimed tweet ids
+            tweet_ids = tweet_ids_pending + tweet_ids_no_scoring
+            if not tweet_ids:
+                return TweetsForScoringResponse(tweets=[], count=0)
 
         # Fetch the claimed tweets + nested author/analysis for response.
         tweets = await prisma.tweet.find_many(
@@ -325,7 +371,7 @@ async def get_unscored_tweets(
             include={"author": True, "analysis": True},
         )
 
-        # Preserve claim order (find_many doesn't guarantee ordering by input list).
+        # Preserve claim order
         tweets_by_id = {t.id: t for t in tweets}
         ordered = [tweets_by_id.get(tid) for tid in tweet_ids if tid in tweets_by_id]
 
