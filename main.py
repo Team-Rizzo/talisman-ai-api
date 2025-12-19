@@ -15,6 +15,13 @@ import logging
 from datetime import datetime
 
 
+# Blocked hotkeys - silently reject requests from these addresses
+# Configure via BLOCKED_HOTKEYS env var (comma-separated ss58 addresses)
+BLOCKED_HOTKEYS: set[str] = set(
+    filter(None, os.getenv("BLOCKED_HOTKEYS", "").split(","))
+)
+
+
 class SuppressV2LogFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         message = record.getMessage()
@@ -23,13 +30,28 @@ class SuppressV2LogFilter(logging.Filter):
         return True
 
 
+class SuppressBlockedHotkeyLogFilter(logging.Filter):
+    """Suppress log messages from blocked hotkeys to reduce spam."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not BLOCKED_HOTKEYS:
+            return True
+        message = record.getMessage()
+        # Suppress logs that mention any blocked hotkey
+        for hotkey in BLOCKED_HOTKEYS:
+            if hotkey in message:
+                return False
+        return True
+
+
 logging.getLogger("uvicorn.access").addFilter(SuppressV2LogFilter())
+logging.getLogger("uvicorn.access").addFilter(SuppressBlockedHotkeyLogFilter())
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
 from fastapi import FastAPI, Depends, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from prisma import Prisma
 
 # Local imports
@@ -65,6 +87,10 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# Apply blocked hotkey log filter to relevant loggers
+logging.getLogger("utils.auth").addFilter(SuppressBlockedHotkeyLogFilter())
+logger.addFilter(SuppressBlockedHotkeyLogFilter())
 
 # Initialize Prisma client
 prisma = Prisma()
@@ -119,6 +145,33 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class BlockedHotkeyMiddleware(BaseHTTPMiddleware):
+    """
+    Middleware to silently reject requests from blocked hotkeys.
+    
+    Runs before authentication and rejects known bad actors
+    with minimal processing and no logging.
+    """
+    
+    async def dispatch(self, request: Request, call_next):
+        hotkey = request.headers.get("X-Auth-SS58Address", "")
+        
+        if hotkey and hotkey in BLOCKED_HOTKEYS:
+            # Silently reject - no logging to reduce spam
+            return JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content={"detail": "Access denied."},
+            )
+        
+        return await call_next(request)
+
+
+# Add blocked hotkey middleware (runs before auth)
+if BLOCKED_HOTKEYS:
+    app.add_middleware(BlockedHotkeyMiddleware)
+    logger.info(f"Hotkey blocklist enabled with {len(BLOCKED_HOTKEYS)} hotkeys")
 
 
 # ============================================================================
