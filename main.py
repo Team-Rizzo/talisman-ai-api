@@ -324,21 +324,15 @@ async def health_check():
     "/price/tao-usd",
     response_model=TaoPriceResponse,
     responses={
-        401: {"model": ErrorResponse},
-        403: {"model": ErrorResponse},
         503: {"model": ErrorResponse},
     },
 )
-async def get_tao_price(
-    validator_hotkey: str = Depends(get_validator_hotkey),
-):
+async def get_tao_price():
     """
     Get the cached TAO/USD price.
     
     Returns the TAO price in USD, fetched from TaoStats and cached every 15 minutes.
     If the cache is empty (e.g., on first startup before fetch completes), returns 503.
-    
-    Only accessible by validators.
     """
     cache = get_cached_price()
     
@@ -407,10 +401,13 @@ async def get_unscored_tweets(
             claimed_pending = await tx.query_raw(
                 """
                 WITH picked AS (
-                    SELECT id, tweet_id
-                    FROM scoring
-                    WHERE status = 'pending'
-                    ORDER BY created_at ASC, id ASC
+                    SELECT s.id, s.tweet_id
+                    FROM scoring s
+                    JOIN tweets t ON t.id = s.tweet_id
+                    WHERE s.status = 'pending'
+                      AND t.text IS NOT NULL
+                      AND BTRIM(t.text) <> ''
+                    ORDER BY s.created_at ASC, s.id ASC
                     FOR UPDATE SKIP LOCKED
                     LIMIT $1
                 )
@@ -442,6 +439,8 @@ async def get_unscored_tweets(
                         LEFT JOIN scoring s ON s.tweet_id = t.id
                         LEFT JOIN tweet_analysis a ON a.tweet_id = t.id
                         WHERE s.id IS NULL AND a.id IS NULL
+                          AND t.text IS NOT NULL
+                          AND BTRIM(t.text) <> ''
                         ORDER BY t.created_at ASC, t.id ASC
                         LIMIT $1
                         FOR UPDATE OF t SKIP LOCKED
@@ -475,6 +474,11 @@ async def get_unscored_tweets(
 
         tweets_with_authors = []
         for tweet in ordered:
+            # Defensive safety check: never send tweets with NULL/empty/whitespace-only text.
+            # (We also filter at claim-time in SQL to avoid leasing these in the first place.)
+            if tweet is None or tweet.text is None or not str(tweet.text).strip():
+                continue
+
             author_model = None
             analysis_model = None
 
