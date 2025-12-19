@@ -43,8 +43,21 @@ class SuppressBlockedHotkeyLogFilter(logging.Filter):
         return True
 
 
+class SuppressBlockedRequestsFilter(logging.Filter):
+    """Suppress uvicorn access logs for 403 Forbidden responses (blocked hotkeys)."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not BLOCKED_HOTKEYS:
+            return True
+        message = record.getMessage()
+        # Suppress 403 Forbidden access logs when blocklist is active
+        if '" 403 Forbidden' in message or '" 403 ' in message:
+            return False
+        return True
+
+
 logging.getLogger("uvicorn.access").addFilter(SuppressV2LogFilter())
 logging.getLogger("uvicorn.access").addFilter(SuppressBlockedHotkeyLogFilter())
+logging.getLogger("uvicorn.access").addFilter(SuppressBlockedRequestsFilter())
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
