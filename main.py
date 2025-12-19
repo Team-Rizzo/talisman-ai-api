@@ -55,9 +55,6 @@ class SuppressBlockedRequestsFilter(logging.Filter):
         return True
 
 
-logging.getLogger("uvicorn.access").addFilter(SuppressV2LogFilter())
-logging.getLogger("uvicorn.access").addFilter(SuppressBlockedHotkeyLogFilter())
-logging.getLogger("uvicorn.access").addFilter(SuppressBlockedRequestsFilter())
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
@@ -101,12 +98,44 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Apply blocked hotkey log filter to relevant loggers
+# Apply log filters to suppress blocked hotkey spam
 logging.getLogger("utils.auth").addFilter(SuppressBlockedHotkeyLogFilter())
 logger.addFilter(SuppressBlockedHotkeyLogFilter())
 
+# Apply filters to uvicorn access logs
+uvicorn_access_logger = logging.getLogger("uvicorn.access")
+uvicorn_access_logger.addFilter(SuppressV2LogFilter())
+uvicorn_access_logger.addFilter(SuppressBlockedHotkeyLogFilter())
+uvicorn_access_logger.addFilter(SuppressBlockedRequestsFilter())
+
 # Initialize Prisma client
 prisma = Prisma()
+
+
+def _setup_log_filters():
+    """Set up log filters to suppress blocked hotkey spam."""
+    filters_to_add = [SuppressV2LogFilter(), SuppressBlockedHotkeyLogFilter(), SuppressBlockedRequestsFilter()]
+    
+    # Apply to uvicorn.access logger
+    uvicorn_logger = logging.getLogger("uvicorn.access")
+    for f in filters_to_add:
+        if not any(isinstance(existing, type(f)) for existing in uvicorn_logger.filters):
+            uvicorn_logger.addFilter(f)
+    
+    # Also apply to all handlers on the logger
+    for handler in uvicorn_logger.handlers:
+        for f in filters_to_add:
+            if not any(isinstance(existing, type(f)) for existing in handler.filters):
+                handler.addFilter(f)
+    
+    # Apply to root logger handlers as well (uvicorn often logs to root)
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers:
+        for f in filters_to_add:
+            if not any(isinstance(existing, type(f)) for existing in handler.filters):
+                handler.addFilter(f)
+    
+    logger.info(f"Log filters applied. Blocking {len(BLOCKED_HOTKEYS)} hotkeys from logs.")
 
 
 @asynccontextmanager
@@ -114,6 +143,9 @@ async def lifespan(app: FastAPI):
     """Application lifespan manager for startup/shutdown events."""
     # Startup
     logger.info("Starting Talisman AI API...")
+    
+    # Re-apply log filters (uvicorn may reconfigure loggers on startup)
+    _setup_log_filters()
     
     # Initialize whitelist caches
     try:
