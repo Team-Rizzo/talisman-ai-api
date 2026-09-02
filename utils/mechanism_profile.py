@@ -74,8 +74,14 @@ def _int(section: str, d: dict, key: str, lo: int, hi: int) -> int:
     return v
 
 
+def _bool(section: str, d: dict, key: str) -> None:
+    if key in d and not isinstance(d[key], bool):
+        raise ProfileError(f"{section}.{key} must be true or false")
+
+
 def _check_settlement(d: dict) -> None:
     _num("settlement", d, "C", 0.0, 1e15, lo_open=True)
+    _bool("settlement", d, "floor_gating")
 
 
 def _check_emission(d: dict) -> None:
@@ -104,6 +110,7 @@ def _check_rations(d: dict) -> None:
     _num("rations", d, "fill_gate", 0.0, 1.0)
     _int("rations", d, "boost_days", 0, 365)
     _num("rations", d, "boost_tranche_max", 0.0, 1.0)
+    _bool("rations", d, "dispatch")
 
 
 def _check_oracle(d: dict) -> None:
@@ -131,6 +138,7 @@ def _check_oracle(d: dict) -> None:
     _int("oracle", d, "claim_cap", 1, 10_000)
     _num("oracle", d, "keeper_weight", 0.0, 10.0)
     _int("oracle", d, "schema_cutover_block", 0, 2**63 - 1)
+    _bool("oracle", d, "live")
 
 
 def _check_controller(d: dict) -> None:
