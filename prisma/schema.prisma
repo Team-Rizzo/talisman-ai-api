@@ -902,3 +902,37 @@ model MinerEvent {
   @@index([minerHotkey, occurredAt], name: "idx_miner_event_miner_time")
   @@map("miner_event")
 }
+
+/// Published mechanism profiles: one signed, versioned object carrying every economic
+/// value validators resolve by block height. Append-only. There is no edit or delete
+/// path; rolling back is publishing the old body under a higher version, so the served
+/// history is the whole record of what the mechanism has ever been.
+model MechanismProfile {
+  version         Int      @id
+  publishBlock    Int      @map("publish_block")
+  activationBlock Int      @map("activation_block")
+  schemaVersion   String   @map("schema_version")
+  body            Json
+  signature       String
+  publishedBy     String?  @map("published_by")
+  publishedAt     DateTime @default(now()) @map("published_at") @db.Timestamptz
+
+  @@index([activationBlock], name: "idx_mechanism_profile_activation")
+  @@map("mechanism_profile")
+}
+
+/// Capacity-controller steps proposed by validators. INFORMATIONAL ONLY: a proposal
+/// never changes capacity. Capacity moves when an operator publishes a profile carrying
+/// the new value, so this is a record of what validators observed, not an input.
+model ControllerProposal {
+  id              BigInt   @id @default(autoincrement())
+  validatorHotkey String   @map("validator_hotkey")
+  epoch           Int
+  roiEma          Float    @map("roi_ema")
+  direction       Int
+  magnitude       Float
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  @@index([epoch], name: "idx_controller_proposal_epoch")
+  @@map("controller_proposal")
+}

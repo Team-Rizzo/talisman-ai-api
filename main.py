@@ -15,8 +15,9 @@ import os
 import math
 import json
 import logging
+import time
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 # Blocked hotkeys - silently reject requests from these addresses
@@ -77,6 +78,9 @@ import httpx
 
 # Local imports
 from models import (
+    MechanismProfileResponse,
+    MechanismAnchorResponse,
+    ControllerProposalSubmission,
     Tweet, TweetWithAuthor, Account, TweetAnalysis,
     Scoring, ScoringUpdate,
     Penalty, PenaltyCreate, PenaltyBulkCreate,
@@ -103,6 +107,7 @@ from models import (
     MinerEventBulkCreate,
 )
 import dispatch_status_store
+from utils import mechanism_profile as mprofile
 from utils.auth import (
     AuthRequest,
     auth_config,
@@ -2699,6 +2704,131 @@ app.include_router(dashboard_router)
 # ============================================================================
 # Main Entry Point
 # ============================================================================
+
+# ============================================================================
+# MECHANISM PROFILE
+# ============================================================================
+# One signed, versioned object carrying every economic value. Validators resolve
+# between `current` and `next` by block height, so config and code land together and a
+# half-applied mechanism state cannot exist. Append-only: there is no edit or delete
+# path, and rolling back is publishing the old body under a higher version.
+
+_PROFILE_CACHE_SECONDS = 60
+_profile_cache: dict = {"at": 0.0, "body": None}
+
+
+def _profile_row_to_dict(row) -> dict:
+    body = dict(row.body or {})
+    body["signature"] = row.signature
+    return body
+
+
+async def _load_profiles() -> dict:
+    """The two profiles a validator needs: what is in force, and what is staged.
+
+    Both are decided by block height on the validator, so this only splits the history
+    into the newest published version and the one before it.
+    """
+    rows = await prisma.mechanismprofile.find_many(
+        order={"version": "desc"}, take=2)
+    if not rows:
+        return {"current": None, "next": None}
+    if len(rows) == 1:
+        return {"current": _profile_row_to_dict(rows[0]), "next": None}
+    return {"current": _profile_row_to_dict(rows[1]),
+            "next": _profile_row_to_dict(rows[0])}
+
+
+@app.get("/mechanism/profile", response_model=MechanismProfileResponse)
+async def get_mechanism_profile():
+    """Serve the signed profiles. Unauthenticated: the signature is what makes it
+    trustworthy, not who asked, and miners benefit from reading the same values."""
+    now = time.time()
+    if _profile_cache["body"] is not None and (now - _profile_cache["at"]) < _PROFILE_CACHE_SECONDS:
+        return MechanismProfileResponse(**_profile_cache["body"])
+
+    try:
+        payload = await _load_profiles()
+    except Exception as e:
+        logger.error(f"Failed to load mechanism profiles: {e}")
+        if _profile_cache["body"] is not None:
+            return MechanismProfileResponse(**_profile_cache["body"])
+        raise HTTPException(status_code=503, detail="profile unavailable")
+
+    _profile_cache.update({"at": now, "body": payload})
+    return MechanismProfileResponse(**payload)
+
+
+@app.get("/mechanism/anchor", response_model=MechanismAnchorResponse)
+async def get_mechanism_anchor():
+    """Publish what capacity is, and what the crawl actually supplies.
+
+    Capacity means the work that exists to be done, so the reference derives from
+    ingest rather than from what miners produced: anchoring to trailing output would
+    hold burn at a constant whatever anyone did. Published, never enforced.
+    """
+    try:
+        profiles = await _load_profiles()
+        current = profiles.get("current") or {}
+        capacity = ((current.get("settlement") or {}).get("C"))
+
+        since = datetime.now(timezone.utc) - timedelta(days=7)
+        usable_ingest = await prisma.newsarticle.count(where={"createdAt": {"gte": since}})
+        rewarded = await prisma.reward.find_many(where={"createdAt": {"gte": since}})
+        points = float(sum(float(r.reward or 0) for r in rewarded))
+
+        epochs = 7 * 72.0
+        ingest_per_epoch = usable_ingest / epochs if epochs else None
+        pts_per_article = (points / usable_ingest) if usable_ingest else None
+        anchor = (ingest_per_epoch * pts_per_article
+                  if ingest_per_epoch and pts_per_article else None)
+
+        latest = await prisma.controllerproposal.find_first(order={"epoch": "desc"})
+        return MechanismAnchorResponse(
+            capacity=capacity,
+            capacity_anchor=anchor,
+            anchor_ratio=(capacity / anchor if capacity and anchor else None),
+            usable_ingest_per_epoch=ingest_per_epoch,
+            pts_per_article=pts_per_article,
+            roi_ema=(float(latest.roiEma) if latest else None),
+            last_step=({"epoch": latest.epoch, "direction": latest.direction,
+                        "magnitude": latest.magnitude} if latest else None),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to build mechanism anchor: {e}")
+        raise HTTPException(status_code=503, detail="anchor unavailable")
+
+
+@app.post(
+    "/mechanism/proposal",
+    response_model=SubmissionResponse,
+    responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}},
+)
+async def submit_controller_proposal(
+    submission: ControllerProposalSubmission,
+    validator_hotkey: str = Depends(get_validator_hotkey),
+):
+    """Record that a validator's controller step rule armed.
+
+    INFORMATIONAL ONLY. This never changes capacity: capacity moves when an operator
+    publishes a profile carrying the new value, with the usual activation lead, so
+    there is no path here that alters what anyone is paid.
+    """
+    try:
+        await prisma.controllerproposal.create(data={
+            "validatorHotkey": validator_hotkey,
+            "epoch": int(submission.epoch),
+            "roiEma": float(submission.roi_ema),
+            "direction": int(submission.direction),
+            "magnitude": float(submission.magnitude),
+        })
+        return SubmissionResponse(success=True, message="proposal recorded", count=1)
+    except Exception as e:
+        logger.error(f"Failed to record controller proposal: {e}")
+        raise HTTPException(status_code=500, detail="could not record proposal")
+
 
 if __name__ == "__main__":
     import uvicorn

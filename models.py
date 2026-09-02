@@ -665,3 +665,40 @@ class CompletedNewsArticleSubmission(BaseModel):
 class CompletedNewsArticlesSubmission(BaseModel):
     """Model for submitting multiple completed scored news articles."""
     completed_articles: List[CompletedNewsArticleSubmission]
+
+
+# ---- Mechanism profile ------------------------------------------------------------
+
+class MechanismProfileResponse(BaseModel):
+    """The profile in force and the one staged behind it, each signed.
+
+    A validator resolves between them by block height, so both are served together and
+    neither is described as active here.
+    """
+    current: Optional[dict] = None
+    next: Optional[dict] = None
+
+
+class MechanismAnchorResponse(BaseModel):
+    """Why burn is what it is: capacity, what the crawl supplies, and the ratio.
+
+    Published rather than enforced. Capacity moves only by a profile publish.
+    """
+    capacity: Optional[float] = None
+    capacity_anchor: Optional[float] = None
+    anchor_ratio: Optional[float] = None
+    usable_ingest_per_epoch: Optional[float] = None
+    pts_per_article: Optional[float] = None
+    roi_ema: Optional[float] = None
+    last_step: Optional[dict] = None
+
+
+class ControllerProposalSubmission(BaseModel):
+    """A validator's observation that the controller's step rule has armed.
+
+    Informational. Capacity changes when an operator publishes a profile, never here.
+    """
+    epoch: int
+    roi_ema: float
+    direction: int = Field(..., ge=-1, le=1)
+    magnitude: float = Field(..., ge=0.0, le=1.0)
