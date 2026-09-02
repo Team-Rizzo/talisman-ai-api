@@ -2739,10 +2739,20 @@ async def _load_profiles() -> dict:
             "next": _profile_row_to_dict(rows[0])}
 
 
-@app.get("/mechanism/profile", response_model=MechanismProfileResponse)
-async def get_mechanism_profile():
-    """Serve the signed profiles. Unauthenticated: the signature is what makes it
-    trustworthy, not who asked, and miners benefit from reading the same values."""
+@app.get(
+    "/mechanism/profile",
+    response_model=MechanismProfileResponse,
+    responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}},
+)
+async def get_mechanism_profile(validator_hotkey: str = Depends(get_validator_hotkey)):
+    """Serve the signed profiles to validators only.
+
+    Authenticated deliberately. The signature makes the contents trustworthy, but it
+    does not make them safe to publish: the grader model list would let a submitter
+    tune its output to the models that grade it, which is what the rotation exists to
+    prevent. The handoff spec calls for an unauthenticated read; that is the one part
+    of it we do not follow.
+    """
     now = time.time()
     if _profile_cache["body"] is not None and (now - _profile_cache["at"]) < _PROFILE_CACHE_SECONDS:
         return MechanismProfileResponse(**_profile_cache["body"])
@@ -2759,8 +2769,12 @@ async def get_mechanism_profile():
     return MechanismProfileResponse(**payload)
 
 
-@app.get("/mechanism/anchor", response_model=MechanismAnchorResponse)
-async def get_mechanism_anchor():
+@app.get(
+    "/mechanism/anchor",
+    response_model=MechanismAnchorResponse,
+    responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}},
+)
+async def get_mechanism_anchor(validator_hotkey: str = Depends(get_validator_hotkey)):
     """Publish what capacity is, and what the crawl actually supplies.
 
     Capacity means the work that exists to be done, so the reference derives from
