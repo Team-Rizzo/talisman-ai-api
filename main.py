@@ -2723,20 +2723,40 @@ def _profile_row_to_dict(row) -> dict:
     return body
 
 
+async def _current_block():
+    """Chain head, or None when it cannot be read."""
+    try:
+        import bittensor as bt
+        return int(bt.subtensor(network=os.getenv("SUBTENSOR_NETWORK", "finney")).block)
+    except Exception as e:
+        logger.warning(f"Could not read the chain head for profile resolution: {e}")
+        return None
+
+
 async def _load_profiles() -> dict:
     """The two profiles a validator needs: what is in force, and what is staged.
 
     Both are decided by block height on the validator, so this only splits the history
     into the newest published version and the one before it.
     """
-    rows = await prisma.mechanismprofile.find_many(
-        order={"version": "desc"}, take=2)
+    rows = await prisma.mechanismprofile.find_many(order={"version": "desc"}, take=16)
     if not rows:
         return {"current": None, "next": None}
-    if len(rows) == 1:
+
+    # Resolve by activation, not by version order. The active profile is the highest
+    # version whose activation block has passed; the staged one is the earliest that
+    # has not. Labelling the two newest rows would hide the active profile whenever
+    # more than one future publish is pending.
+    block = await _current_block()
+    if block is None:
         return {"current": _profile_row_to_dict(rows[0]), "next": None}
-    return {"current": _profile_row_to_dict(rows[1]),
-            "next": _profile_row_to_dict(rows[0])}
+
+    activated = [r for r in rows if r.activationBlock <= block]
+    pending = [r for r in rows if r.activationBlock > block]
+    current = max(activated, key=lambda r: r.version) if activated else None
+    nxt = min(pending, key=lambda r: (r.activationBlock, r.version)) if pending else None
+    return {"current": _profile_row_to_dict(current) if current else None,
+            "next": _profile_row_to_dict(nxt) if nxt else None}
 
 
 @app.get(
