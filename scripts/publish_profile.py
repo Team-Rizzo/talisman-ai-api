@@ -34,6 +34,9 @@ BLOCKS_PER_DAY = 86_400 // SECONDS_PER_BLOCK
 # is itself a publish, so a hard minimum would make a bad value uncorrectable for a week.
 CAPACITY_NOTICE_DAYS = 7
 
+# The first validator release that resolves profiles. Anything older fetches nothing.
+_MIN_VALIDATOR_VERSION = os.getenv("MIN_VALIDATOR_VERSION", "3.6.0")
+
 # Switches that change what miners are paid. Called out separately at publish time.
 SWITCHES = (("settlement", "live"), ("settlement", "floor_gating"),
             ("rations", "dispatch"), ("oracle", "live"))
@@ -122,10 +125,16 @@ async def publish(path: Path, activate_in: int, published_by: str, dry_run: bool
     prisma = Prisma()
     await prisma.connect()
     try:
-        rows = await prisma.mechanismprofile.find_many(order={"version": "desc"}, take=1)
-        latest = rows[0] if rows else None
-        latest_version = latest.version if latest else None
-        live = (latest.body or {}) if latest else None
+        rows = await prisma.mechanismprofile.find_many(order={"version": "desc"},
+                                                      take=16)
+        latest_version = rows[0].version if rows else None
+        # What is in force now, not merely the newest row. With a publish already
+        # pending, the newest row is the future one, and diffing against it would
+        # describe changes nobody is running.
+        activated = [r for r in rows if r.activationBlock <= int(block)]
+        active = max(activated, key=lambda r: r.version) if activated else None
+        live = (active.body or {}) if active else None
+        pending = [r for r in rows if r.activationBlock > int(block)]
 
         body["publish_block"] = int(block)
         body["activation_block"] = int(block) + int(activate_in)
@@ -141,7 +150,9 @@ async def publish(path: Path, activate_in: int, published_by: str, dry_run: bool
         lead = body["activation_block"] - body["publish_block"]
         lead_days = lead / BLOCKS_PER_DAY
         print(f"version          {body['version']}"
-              f"{f' (live: {latest_version})' if latest_version else ''}")
+              f"{f' (active: {active.version})' if active else ' (none active)'}")
+        for row in sorted(pending, key=lambda r: r.activationBlock):
+            print(f"  PENDING        v{row.version} activates at {row.activationBlock}")
         print(f"publish block    {body['publish_block']}  (chain head)")
         print(f"activation block {body['activation_block']}  "
               f"(+{lead} blocks, {lead_days:.1f} days)")
@@ -169,7 +180,8 @@ async def publish(path: Path, activate_in: int, published_by: str, dry_run: bool
                 f"capacity changes with {lead_days:.1f} days of notice; §E14 asks for "
                 f"{CAPACITY_NOTICE_DAYS}. Fine for a correction, thin for a step.")
 
-        fleet = await fleet_readiness(prisma, body.get("schema_version"))
+        required = body.get("schema_version")
+        fleet = await fleet_readiness(prisma, required)
         if fleet is None:
             warnings.append("could not read validator versions; publishing blind to "
                             "what the fleet is running.")
@@ -182,6 +194,12 @@ async def publish(path: Path, activate_in: int, published_by: str, dry_run: bool
             if not fleet:
                 warnings.append("no validators have reported a version; a profile they "
                                 "cannot fetch changes nothing.")
+            stale = [str(r.get("validator_hotkey", "?"))[:12] for r in fleet
+                     if str(r.get("version", "")) < str(_MIN_VALIDATOR_VERSION)]
+            if stale:
+                warnings.append(
+                    f"{len(stale)} validator(s) below {_MIN_VALIDATOR_VERSION} "
+                    f"({', '.join(stale)}); they may not apply this profile.")
 
         for w in warnings:
             print(f"\nWARNING: {w}")
