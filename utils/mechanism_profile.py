@@ -81,7 +81,7 @@ def _bool(section: str, d: dict, key: str) -> None:
 
 def _check_settlement(d: dict) -> None:
     _num("settlement", d, "C", 0.0, 1e15, lo_open=True)
-    _bool("settlement", d, "floor_gating")
+    _bool("settlement", d, "floor_gating")   # defaults true on the validator
     _bool("settlement", d, "live")
 
 
