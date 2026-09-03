@@ -7,16 +7,36 @@ from pathlib import Path
 
 import pytest
 
-_stub = types.ModuleType("prisma")
-_stub.Json = lambda x: x
-_stub.Prisma = object
-sys.modules.setdefault("prisma", _stub)
+def _load():
+    """Load the script without a generated prisma client, and without leaving a stub
+    behind — other tests in this suite import the real one."""
+    real = sys.modules.get("prisma")
+    try:
+        import prisma  # noqa: F401
+        stubbed = False
+    except Exception:
+        stub = types.ModuleType("prisma")
+        stub.Json = lambda x: x
+        stub.Prisma = object
+        sys.modules["prisma"] = stub
+        stubbed = True
 
-_spec = importlib.util.spec_from_file_location(
-    "publish_profile", Path(__file__).resolve().parent.parent
-    / "scripts" / "publish_profile.py")
-pp = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(pp)
+    spec = importlib.util.spec_from_file_location(
+        "publish_profile", Path(__file__).resolve().parent.parent
+        / "scripts" / "publish_profile.py")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        if stubbed:
+            if real is not None:
+                sys.modules["prisma"] = real
+            else:
+                sys.modules.pop("prisma", None)
+    return module
+
+
+pp = _load()
 
 
 # ---- durations ---------------------------------------------------------------------
