@@ -37,6 +37,19 @@ CAPACITY_NOTICE_DAYS = 7
 # The first validator release that resolves profiles. Anything older fetches nothing.
 _MIN_VALIDATOR_VERSION = os.getenv("MIN_VALIDATOR_VERSION", "3.6.0")
 
+
+def _version_tuple(text: str):
+    """Compare versions as numbers. Lexicographically "3.10.0" sorts below "3.6.0"."""
+    parts = []
+    for piece in str(text or "").strip().lstrip("vV").split("."):
+        digits = "".join(c for c in piece if c.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts or [0])
+
+
+def _is_stale(reported: str, minimum: str) -> bool:
+    return _version_tuple(reported) < _version_tuple(minimum)
+
 # Switches that change what miners are paid. Called out separately at publish time.
 SWITCHES = (("settlement", "live"), ("settlement", "floor_gating"),
             ("rations", "dispatch"), ("oracle", "live"))
@@ -72,11 +85,12 @@ def chain_block() -> int | None:
         return None
 
 
-async def fleet_readiness(prisma, min_version: str | None):
+async def fleet_readiness(prisma, min_version: str | None = None):
     """What the validators are running, from their config polls.
 
     A profile published to a fleet that cannot parse it is a silent no-op: those
-    validators carry on with whatever they had.
+    validators carry on with whatever they had. `min_version` marks each row as stale
+    or not so the caller can warn without repeating the comparison.
     """
     try:
         rows = await prisma.query_raw(
@@ -90,6 +104,9 @@ async def fleet_readiness(prisma, min_version: str | None):
         except Exception:
             return None
         rows = [{"validator_hotkey": k, **v} for k, v in data.items()]
+    if min_version:
+        for row in rows:
+            row["stale"] = _is_stale(row.get("version"), min_version)
     return rows
 
 
@@ -125,8 +142,19 @@ async def publish(path: Path, activate_in: int, published_by: str, dry_run: bool
     prisma = Prisma()
     await prisma.connect()
     try:
-        rows = await prisma.mechanismprofile.find_many(order={"version": "desc"},
-                                                      take=16)
+        # Paged rather than capped: a run of pending publishes must not hide the row
+        # that is actually in force.
+        rows, cursor = [], None
+        while True:
+            page = await prisma.mechanismprofile.find_many(
+                order={"version": "desc"}, take=100,
+                **({"cursor": {"version": cursor}, "skip": 1} if cursor else {}))
+            if not page:
+                break
+            rows.extend(page)
+            if any(r.activationBlock <= int(block) for r in page) or len(page) < 100:
+                break
+            cursor = page[-1].version
         latest_version = rows[0].version if rows else None
         # What is in force now, not merely the newest row. With a publish already
         # pending, the newest row is the future one, and diffing against it would
@@ -180,8 +208,8 @@ async def publish(path: Path, activate_in: int, published_by: str, dry_run: bool
                 f"capacity changes with {lead_days:.1f} days of notice; §E14 asks for "
                 f"{CAPACITY_NOTICE_DAYS}. Fine for a correction, thin for a step.")
 
-        required = body.get("schema_version")
-        fleet = await fleet_readiness(prisma, required)
+        required_validator = _MIN_VALIDATOR_VERSION
+        fleet = await fleet_readiness(prisma, required_validator)
         if fleet is None:
             warnings.append("could not read validator versions; publishing blind to "
                             "what the fleet is running.")
@@ -195,10 +223,10 @@ async def publish(path: Path, activate_in: int, published_by: str, dry_run: bool
                 warnings.append("no validators have reported a version; a profile they "
                                 "cannot fetch changes nothing.")
             stale = [str(r.get("validator_hotkey", "?"))[:12] for r in fleet
-                     if str(r.get("version", "")) < str(_MIN_VALIDATOR_VERSION)]
+                     if _is_stale(r.get("version"), required_validator)]
             if stale:
                 warnings.append(
-                    f"{len(stale)} validator(s) below {_MIN_VALIDATOR_VERSION} "
+                    f"{len(stale)} validator(s) below {required_validator} "
                     f"({', '.join(stale)}); they may not apply this profile.")
 
         for w in warnings:

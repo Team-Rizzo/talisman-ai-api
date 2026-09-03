@@ -2739,7 +2739,8 @@ async def _load_profiles() -> dict:
     Both are decided by block height on the validator, so this only splits the history
     into the newest published version and the one before it.
     """
-    rows = await prisma.mechanismprofile.find_many(order={"version": "desc"}, take=16)
+    # Enough to reach past any run of pending publishes to the row in force.
+    rows = await prisma.mechanismprofile.find_many(order={"version": "desc"}, take=200)
     if not rows:
         return {"current": None, "next": None}
 
