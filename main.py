@@ -2739,18 +2739,31 @@ async def _load_profiles() -> dict:
     Both are decided by block height on the validator, so this only splits the history
     into the newest published version and the one before it.
     """
-    # Enough to reach past any run of pending publishes to the row in force.
-    rows = await prisma.mechanismprofile.find_many(order={"version": "desc"}, take=200)
-    if not rows:
-        return {"current": None, "next": None}
-
-    # Resolve by activation, not by version order. The active profile is the highest
-    # version whose activation block has passed; the staged one is the earliest that
-    # has not. Labelling the two newest rows would hide the active profile whenever
-    # more than one future publish is pending.
+    # Paged, not capped. A fixed limit silently loses the profile in force once enough
+    # publishes are pending, and this is the resolver validators actually read: losing
+    # `current` here means every profile-governed mechanism goes inert fleet-wide.
     block = await _current_block()
     if block is None:
-        return {"current": _profile_row_to_dict(rows[0]), "next": None}
+        newest = await prisma.mechanismprofile.find_many(order={"version": "desc"},
+                                                         take=1)
+        return ({"current": _profile_row_to_dict(newest[0]), "next": None}
+                if newest else {"current": None, "next": None})
+
+    rows, cursor = [], None
+    while True:
+        page = await prisma.mechanismprofile.find_many(
+            order={"version": "desc"}, take=100,
+            **({"cursor": {"version": cursor}, "skip": 1} if cursor else {}))
+        if not page:
+            break
+        rows.extend(page)
+        # Descending, so the first activated row reached is the highest active one.
+        if any(r.activationBlock <= block for r in page) or len(page) < 100:
+            break
+        cursor = page[-1].version
+
+    if not rows:
+        return {"current": None, "next": None}
 
     activated = [r for r in rows if r.activationBlock <= block]
     pending = [r for r in rows if r.activationBlock > block]
